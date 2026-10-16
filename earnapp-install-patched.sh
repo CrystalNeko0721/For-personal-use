@@ -21,7 +21,7 @@ exec 8>/run/earnapp-setup.lockfile
 flock -n 8 || { echo SETUP_BUSY; exit 1; }
 D=$(mktemp -d /tmp/earnapp-repair.XXXXXX)
 B=/var/backups/earnapp-$(date +%s)-$$
-PAUSED=0; HELD=0; STEP=prepare; TX_ACTIVE=0; COMMITTED=0; HELPERS_CHANGED=0
+PAUSED=0; HELD=0; STEP=prepare; TX_ACTIVE=0; COMMITTED=0; HELPERS_CHANGED=0; START_ACTION=0; START_CHILD_ACTIVE=0
 backup_path() {
 f=$1
 if grep -Fqx "1 $f" "$B/manifest" || grep -Fqx "0 $f" "$B/manifest"; then return 0; fi
@@ -36,20 +36,94 @@ timeout -k 2 10 rc-service earnapp status 8>&- 9>&- >/dev/null 2>&1 && return 0
 timeout -k 5 30 rc-service earnapp start 8>&- 9>&- || return 1
 timeout -k 2 10 rc-service earnapp status 8>&- 9>&- >/dev/null 2>&1
 }
+earnapp_process_record() {
+ep=$1
+ei=$(start "$ep") || return 1
+awk '/^Uid:/{ok=(NF==5&&$2==0&&$3==0&&$4==0&&$5==0)}END{exit !ok}' "/proc/$ep/status" || return 1
+ec=$(cat "/proc/$ep/comm") || return 1
+case "$ec" in supervise-daemo*)
+tr '\000' '\n' <"/proc/$ep/cmdline" | awk 'NR==1{if($0!~/(^|\/)supervise-daemon$/)exit 1} NR==2{if($0!="earnapp")exit 1} NR>2{if($0=="/usr/bin/earnapp"){app=1;next}if(app&&$0=="--")next;if(app){ok=($0=="run");app=0}}END{exit !ok}' || return 1
+ek=supervisor;;
+*) ew=$(worker_pids) || return 1; printf '%s\n' "$ew" | grep -Fxq "$ep" || return 1; ek=worker;;
+esac
+[ "$(start "$ep")" = "$ei" ] || return 1
+printf '%s %s %s\n' "$ep" "$ei" "$ek"
+}
+earnapp_snapshot() {
+es=0; eq=$(pgrep -f '/usr/bin/[e]arnapp.* run|(^|/)[s]upervise-daemon earnapp( |$)') || es=$?
+[ "$es" -le 1 ] || return 1
+for ep in $eq; do
+[ -d "/proc/$ep" ] || continue
+er=$(earnapp_process_record "$ep") || { [ ! -d "/proc/$ep" ] || return 1; continue; }
+printf '%s\n' "$er"
+done
+}
+record_started_instances() {
+earnapp_snapshot >"$D/started-current" || return 1
+while read -r cp ci ck; do
+if grep -Fxq "$cp $ci $ck" "$B/earnapp-processes"; then continue; fi
+[ "$ci" -ge "$TX_START" ] || return 1
+grep -Fxq "$cp $ci $ck" "$B/earnapp-started" || printf '%s %s %s\n' "$cp" "$ci" "$ck" >>"$B/earnapp-started" || return 1
+done <"$D/started-current"
+}
+rollback_owned() {
+grep -Fxq "$1 $2 $3" "$B/earnapp-started" && return 0
+[ "$3" = worker ] || return 1
+op=$(awk '/^PPid:/{print $2}' "/proc/$1/status") || return 1
+or=$(earnapp_process_record "$op") || return 1
+case "$or" in *" supervisor") grep -Fxq "$or" "$B/earnapp-started";; *) return 1;; esac
+}
+rollback_signal() {
+rs_pid=$1; rs_birth=$2; rs_kind=$3; rs_signal=$4
+[ -d "/proc/$rs_pid" ] || return 0
+rs_record=$(earnapp_process_record "$rs_pid") || return 1
+[ "$rs_record" = "$rs_pid $rs_birth $rs_kind" ] || return 1
+kill -"$rs_signal" "$rs_pid" 2>/dev/null || { [ ! -d "/proc/$rs_pid" ] || return 1; }
+}
+rollback_stop_new() {
+[ "$START_CHILD_ACTIVE" = 0 ] || return 1
+[ -f "$B/earnapp-processes" ] || return 1
+earnapp_snapshot >"$D/rollback-current" || return 1
+: >"$D/rollback-new"
+while read -r rp ri rk; do
+if grep -Fxq "$rp $ri $rk" "$B/earnapp-processes"; then continue; fi
+[ "$START_ACTION" = 1 ] && [ "$ri" -ge "$TX_START" ] && rollback_owned "$rp" "$ri" "$rk" || return 1
+printf '%s %s %s\n' "$rp" "$ri" "$rk" >>"$D/rollback-new"
+done <"$D/rollback-current"
+for signal in TERM KILL; do
+for kind in supervisor worker; do
+while read -r rp ri rk; do
+[ "$rk" != "$kind" ] || rollback_signal "$rp" "$ri" "$rk" "$signal" || return 1
+done <"$D/rollback-new"
+done
+[ "$signal" != TERM ] || [ ! -s "$D/rollback-new" ] || sleep 2
+done
+earnapp_snapshot >"$D/rollback-final" || return 1
+while read -r rp ri rk; do
+grep -Fxq "$rp $ri $rk" "$B/earnapp-processes" || return 1
+done <"$D/rollback-final"
+if [ "$START_ACTION" = 1 ] && [ ! -s "$D/rollback-final" ] && [ -f /etc/init.d/earnapp ]; then
+timeout -k 2 10 rc-service earnapp zap 8>&- 9>&- >/dev/null 2>&1 || return 1
+fi
+}
 rollback() {
 rollback_rc=0
 printf 'ROLLBACK\nSTARTED\n'
+rollback_stop_new || { printf 'ROLLBACK_BLOCKED\nPROCESS_OWNERSHIP_OR_STOP_UNCONFIRMED\nBACKUP\n%s\n' "$B"; return 1; }
 for service in earnapp earnapp_upgrader earnapp-upgrader crond local; do
 for f in /etc/runlevels/*/$service; do
 if [ -e "$f" ] || [ -L "$f" ]; then rm -f -- "$f" || rollback_rc=1; fi
 done
 done
 while read -r present f; do
+case "$f" in /etc/machine-id|/var/lib/dbus/machine-id) [ ! -s /etc/earnapp/uuid ] || continue;; esac
 if [ "$present" = 1 ]; then
 mkdir -p "${f%/*}" && rm -f -- "$f" && cp -a "$B/files$f" "$f" || rollback_rc=1
 else rm -f -- "$f" || rollback_rc=1; fi
 done <"$B/manifest"
+if [ "$(cat "$B/earnapp-state")" = running ]; then
 ensure_started || { printf 'ROLLBACK_START\nFAILED\n'; rollback_rc=1; }
+fi
 if [ "$HELPERS_CHANGED" = 1 ]; then
 : >"$D/rollback.nft"
 if nft list table inet earnapp_limit >/dev/null 2>&1; then printf 'delete table inet earnapp_limit\n' >>"$D/rollback.nft"; fi
@@ -57,7 +131,7 @@ if [ -f "$B/earnapp_limit.nft" ]; then cat "$B/earnapp_limit.nft" >>"$D/rollback
 if [ -s "$D/rollback.nft" ]; then
 nft -c -f "$D/rollback.nft" && nft -f "$D/rollback.nft" || { printf 'ROLLBACK_FIREWALL\nFAILED\n'; rollback_rc=1; }
 fi
-if [ -f "$B/earnapp_limit.nft" ] && [ -x /usr/local/sbin/earnapp-limit ]; then
+if [ "$(cat "$B/earnapp-state")" = running ] && [ -f "$B/earnapp_limit.nft" ] && [ -x /usr/local/sbin/earnapp-limit ]; then
 exec 9>&-
 timeout -k 2 40 /usr/local/sbin/earnapp-limit 20 8>&- || { printf 'ROLLBACK_LIMIT_REFRESH\nFAILED\n'; rollback_rc=1; }
 fi
@@ -157,6 +231,16 @@ if [ -f /etc/init.d/$service ] && timeout -k 2 10 rc-service "$service" status 8
 done
 nft list tables >"$D/initial-tables"
 if grep -Fxq 'table inet earnapp_limit' "$D/initial-tables"; then nft list table inet earnapp_limit >"$B/earnapp_limit.nft"; fi
+EARNAPP_PRIOR=absent
+if [ -f /etc/init.d/earnapp ]; then
+state_rc=0
+timeout -k 2 10 rc-service earnapp status 8>&- 9>&- >/dev/null 2>&1 || state_rc=$?
+case "$state_rc" in 0) EARNAPP_PRIOR=running;; 3) EARNAPP_PRIOR=stopped;; *) echo ORIGINAL_SERVICE_STATE_UNKNOWN; exit 1;; esac
+fi
+printf '%s\n' "$EARNAPP_PRIOR" >"$B/earnapp-state"
+TX_START=$(start self) || { echo PROCESS_BASELINE_FAILED; exit 1; }
+earnapp_snapshot >"$B/earnapp-processes" || { echo PROCESS_BASELINE_FAILED; exit 1; }
+: >"$B/earnapp-started"
 TX_ACTIVE=1
 STEP=upgrader
 disable_upgrader || { echo UPGRADER_STOP_FAILED; exit 1; }
@@ -222,7 +306,13 @@ printf '%s\n' '#!/bin/sh' 'exit 0' >"$D/bin/systemctl"
 printf '%s\n' '#!/bin/sh' 'if [ "$#" = 3 ] && [ "$2" = -O ]; then exec "$EARNAPP_FETCH" "$1" "$3"; fi' 'exec /usr/bin/wget -T 30 "$@"' >"$D/bin/wget"
 chmod 755 "$D/bin/"*
 STEP=vendor_install
-printf 'yes\n' | EARNAPP_FETCH="$D/fetch" PATH="$D/bin:$PATH" timeout 300 bash "$D/vendor" 8>&-
+START_ACTION=1
+START_CHILD_ACTIVE=1
+VENDOR_RC=0
+printf 'yes\n' | EARNAPP_FETCH="$D/fetch" PATH="$D/bin:$PATH" timeout 300 bash "$D/vendor" 8>&- || VENDOR_RC=$?
+START_CHILD_ACTIVE=0
+record_started_instances || { echo PROCESS_CAPTURE_FAILED; exit 1; }
+[ "$VENDOR_RC" = 0 ] || exit "$VENDOR_RC"
 [ -x /usr/bin/earnapp ] || { echo EARNAPP_MISSING; exit 1; }
 fi
 STEP=installed_identity
@@ -237,11 +327,17 @@ STEP=enable_check
 EA_STATUS=$(timeout -k 2 15 /usr/bin/earnapp status 8>&- 9>&- 2>&1) || { echo APP_STATUS_FAILED; exit 1; }
 EA_STATUS=$(printf '%s\n' "$EA_STATUS" | sed "s/$(printf '\033')\[[0-9;]*m//g")
 if printf '%s\n' "$EA_STATUS" | grep -qw disabled; then
-timeout -k 5 30 /usr/bin/earnapp start 8>&- 9>&- || { echo APP_ENABLE_FAILED; exit 1; }
+START_ACTION=1
+START_CHILD_ACTIVE=1
+ENABLE_RC=0
+timeout -k 5 30 /usr/bin/earnapp start 8>&- 9>&- || ENABLE_RC=$?
+START_CHILD_ACTIVE=0
+record_started_instances || { echo PROCESS_CAPTURE_FAILED; exit 1; }
+[ "$ENABLE_RC" = 0 ] || { echo APP_ENABLE_FAILED; exit 1; }
 EA_STATUS=$(timeout -k 2 15 /usr/bin/earnapp status 8>&- 9>&- 2>&1) || { echo APP_STATUS_FAILED; exit 1; }
 fi
 printf '%s\n' "$EA_STATUS" | sed "s/$(printf '\033')\[[0-9;]*m//g" | grep -qw enabled || { echo APP_NOT_ENABLED; exit 1; }
-echo '===== 3/9 OPENRC =====' 
+echo '===== 3/9 OPENRC ====='
 cat >"$D/service" <<'SERVICE'
 #!/sbin/openrc-run
 name=earnapp
@@ -321,21 +417,41 @@ for p in $ids; do i=$(start "$p") || continue; echo "$p $i" >>"$S/pids"; kill -T
 [ -z "$ids" ] || sleep 2
 while read -r p i; do [ "$(start "$p" 2>/dev/null)" != "$i" ] || kill -KILL "$p" 2>/dev/null || true; done <"$S/pids"
 timeout -k 5 30 rc-service earnapp start 8>&- 9>&- || { log START_FAILED; exit 1; }
-n=0; stable=0; last_key=
+recovery_sample() {
+timeout -k 2 10 rc-service earnapp status 8>&- 9>&- >/dev/null 2>&1 || { failure_reason=SERVICE_NOT_RUNNING; return 1; }
+P=$(worker_pid) || { failure_reason=WORKER_IDENTIFICATION_FAILED; return 1; }
+I=$(start "$P") || { failure_reason=BIRTH_PROBE_FAILED; return 1; }
+stats "$P" || { failure_reason=STATS_FAILED; return 1; }
+current_birth=$(start "$P") || { failure_reason=BIRTH_PROBE_FAILED; return 1; }
+[ "$current_birth" = "$I" ] || { failure_reason=WORKER_CHANGED; return 1; }
+}
+n=0; stable=0; last_key=; health_key=; pending_ok=1; failure_reason=NO_SUSTAINED_TCP
 while [ "$n" -lt 24 ]; do
-if P=$(worker_pid) && stats "$P" && [ "$ESTAB" -gt 0 ]; then
-key="$P:$(start "$P")"
+if recovery_sample; then
+key="$P:$I"
+if [ -n "$health_key" ] && [ "$key" != "$health_key" ]; then pending_ok=0; failure_reason=WORKER_CHANGED; fi
+health_key=$key
+if [ "$ESTAB" -gt 0 ]; then
 if [ "$key" = "$last_key" ]; then stable=$((stable+1)); else stable=1; last_key=$key; fi
 if [ "$stable" -ge 7 ]; then
 rm -f "$S/count"
 log "CONNECTION_CHECK_OK pid=$P samples=$stable span=30s udp=$UDP tcp=$TCP estab=$ESTAB fd=$FD rss=$RSS"
 /usr/local/sbin/earnapp-limit --locked 20 || { log LIMIT_UNAVAILABLE; exit 2; }
+printf '%s\n' "$key" >"$S/connection-key" || exit 1
 exit 0
 fi
 else stable=0; last_key=; fi
+else pending_ok=0; stable=0; last_key=; fi
 sleep 5; n=$((n+1))
 done
-log RECOVERY_FAILED_NO_SUSTAINED_TCP
+if [ "$pending_ok" = 1 ] && [ -n "$health_key" ] && recovery_sample; then
+if [ "$P:$I" != "$health_key" ]; then log "RECOVERY_FAILED reason=WORKER_CHANGED"; exit 1; fi
+/usr/local/sbin/earnapp-limit --locked 20 || { log LIMIT_UNAVAILABLE; exit 2; }
+printf '%s\n' "$health_key" >"$S/connection-key" || exit 1
+log "CONNECTION_PENDING pid=$P samples=$n service=running stats=readable limit=20"
+exit 10
+fi
+log "RECOVERY_FAILED reason=$failure_reason"
 exit 1
 RECOVER
 cat >"$D/limit" <<'LIMITER'
@@ -453,7 +569,11 @@ disable_upgrader || { echo UPGRADER_STOP_FAILED; exit 1; }
 printf 'UPGRADER_DISABLED\n1\n'
 rc-update add earnapp default 8>&- 9>&-
 SETUP_RECOVERY_RC=0
+START_ACTION=1
+START_CHILD_ACTIVE=1
 /usr/local/sbin/earnapp-recover --locked setup 8>&- || SETUP_RECOVERY_RC=$?
+START_CHILD_ACTIVE=0
+record_started_instances || { echo PROCESS_CAPTURE_FAILED; exit 1; }
 echo '===== 7/9 WATCHDOG ====='
 STEP=cron
 if grep -q '# EARNAPP-12H-STOPSTART' "$B/crontab"; then echo '0 */12 * * * /usr/local/sbin/earnapp-recover scheduled >/dev/null 2>&1 # EARNAPP-12H-STOPSTART' >>/etc/crontabs/root; fi
@@ -465,13 +585,23 @@ rc-service crond status 8>&- 9>&-
 PAUSED=0
 echo '===== 8/9 STATUS ====='
 STEP=verify
-[ "$SETUP_RECOVERY_RC" = 0 ] || { printf 'RECOVERY_CHECK_FAILED\nRC\n%s\n' "$SETUP_RECOVERY_RC"; exit "$SETUP_RECOVERY_RC"; }
-P=$(worker_pid); stats "$P"; [ "$ESTAB" -gt 0 ]
+case "$SETUP_RECOVERY_RC" in
+0) CONNECTION_STATE=VERIFIED;;
+10) CONNECTION_STATE=PENDING;;
+*) printf 'RECOVERY_CHECK_FAILED\nRC\n%s\n' "$SETUP_RECOVERY_RC"; exit "$SETUP_RECOVERY_RC";;
+esac
+verify_setup_worker() {
+timeout -k 2 10 rc-service earnapp status 8>&- 9>&- >/dev/null 2>&1 || { echo SERVICE_NOT_RUNNING; return 1; }
+P=$(worker_pid) && I=$(start "$P") && stats "$P" || { echo WORKER_OR_STATS_FAILED; return 1; }
+[ "$(start "$P")" = "$I" ] && [ "$(cat "$S/connection-key")" = "$P:$I" ] || { echo WORKER_CHANGED_AFTER_RECOVERY; return 1; }
+[ "$CONNECTION_STATE" != VERIFIED ] || [ "$ESTAB" -gt 0 ] || { echo CONNECTION_CHECK_EXPIRED; return 1; }
+}
+verify_setup_worker || exit 1
 verify_identity
 printf 'MACHINE_ID\n%s\nDEVICE_ID\n%s\nLINK_URL\nhttps://earnapp.com/r/%s\n' "$MACHINE_EXPECTED" "$ID_AFTER" "$ID_AFTER"
 if [ -n "$ID_BEFORE" ]; then echo ID_UNCHANGED; fi
 for f in uuid registered tracking_id consent oldcid status; do if [ -s "/etc/earnapp/$f" ]; then printf 'IDENTITY_FILE\n%s\nSTATE\nPRESENT\n' "$f"; else printf 'IDENTITY_FILE\n%s\nSTATE\nMISSING\n' "$f"; fi; done
-printf 'DASHBOARD_STATUS\nMANUAL_VERIFICATION_REQUIRED\n'
+printf 'DASHBOARD_STATUS\nUNKNOWN\n'
 printf 'PID\n%s\nFD\n%s\nUDP\n%s\nTCP\n%s\nESTAB\n%s\nRSS_KB\n%s\nBACKUP\n%s\n' "$P" "$FD" "$UDP" "$TCP" "$ESTAB" "$RSS" "$B"
 PUBLIC_IPV4=UNKNOWN; COUNTRY_CODE=UNKNOWN
 if candidate=$(curl -q -4 --noproxy '*' -fsS --proto '=https' --connect-timeout 4 --max-time 6 https://api.ipify.org 8>&- 9>&-); then
@@ -487,7 +617,10 @@ printf 'PUBLIC_IPV4\n%s\nCOUNTRY_CODE\n%s\n' "$PUBLIC_IPV4" "$COUNTRY_CODE"
 R=0
 /usr/local/sbin/earnapp-limit --locked 20 || R=2
 [ "$R" = 0 ] || exit "$R"
+verify_setup_worker || exit 1
+verify_identity || exit 1
 COMMITTED=1
 echo '===== 9/9 DONE ====='
+printf 'INSTALL_STATE\nCOMPLETE\nCONNECTION_STATE\n%s\nDASHBOARD_STATUS\nUNKNOWN\n' "$CONNECTION_STATE"
 printf 'SETUP_RC\n%s\n' "$R"
 exit "$R"
