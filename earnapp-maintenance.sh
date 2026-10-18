@@ -1,6 +1,6 @@
 #!/bin/sh
-# EarnApp maintenance: actual service identity, logs and recovery records retained.
-# Version 2026.10.18.5. Auxiliary filenames are documented by the names command.
+# EarnApp unified installer and maintenance, local candidate 2026.10.19.2.
+# Supports Alpine x86_64; original SDK and identity are retained for recovery.
 set -u
 SDK_BIN=${SDK_BIN:-}
 OLD_SVC=earnapp
@@ -237,7 +237,18 @@ for mode in auto ipv6 tls12; do
   case "$mode" in auto) set --;; ipv6) set -- -6;; tls12) set -- -4 --http1.1 --tlsv1.2 --tls-max 1.2;; esac
   attempts=$((attempts+1)); result=0; reason=empty_response
   if curl -q "$@" --silent -fL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 30 --url "$url" --output "$file" 2>/dev/null; then
-    [ ! -s "$file" ] || exit 0
+    if [ -s "$file" ]; then
+      case "$url" in
+        */earnapp-x64-1.665.73)
+          fetched_hash=$(sha256sum "$file") || exit 1
+          [ "${fetched_hash%% *}" = a5080f9eff9df9f59a2192ccafc344f06259bfffe2a0aee619d44c8cafbd8def ] || {
+            printf '%s\n' FETCH_SDK_HASH_MISMATCH >&2; exit 1;
+          };;
+        */earnapp-install-1.665.73.sh) :;;
+        *) printf '%s\n' FETCH_UNEXPECTED_VENDOR_ARTIFACT >&2; exit 1;;
+      esac
+      exit 0
+    fi
   else
     result=$?
     case "$result" in
@@ -324,7 +335,7 @@ BOOTSTRAP_WGET
     chmod 755 "$SB_DIR/bin/lsb_release" "$SB_DIR/bin/hostnamectl" "$SB_DIR/bin/systemctl" "$SB_DIR/bin/wget" || exit 1
     SB_VENDOR_RC=0
     printf 'yes\n' | env -u BASE_URL -u PRODUCT -u FORCE_SSL_BUILD -u FORCE_NO_SSL_BUILD \
-      -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS EARNAPP_FETCH="$SB_DIR/fetch" PATH="$SB_DIR/bin:$PATH" \
+      -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS FORCE_NO_SSL_BUILD=1 EARNAPP_FETCH="$SB_DIR/fetch" PATH="$SB_DIR/bin:$PATH" \
       timeout -k 5 300 bash --noprofile --norc "$SB_DIR/vendor.sh" || SB_VENDOR_RC=$?
     if ! sb_check_identity /etc/machine-id machine || ! sb_check_identity /var/lib/dbus/machine-id dbus ||
        ! sb_check_identity /etc/earnapp/uuid uuid; then
@@ -582,7 +593,7 @@ suite_updater_guard(){
 }
 
 # Source module: maintenance-helper-module.sh
-# EARNAPP-MAINTENANCE-2026.10.18.2 EarnApp maintenance helpers; the original SDK and service are retained.
+# EARNAPP-MAINTENANCE-2026.10.18.2 EarnApp maintenance helpers with explicit program and service identities.
 suite_stage_helpers() (
 [ "$#" -ge 3 ] && [ "$#" -le 4 ] || return 1
 NS_DIR=$1; NS_TARGET=$2; NS_SERVICE=$3
@@ -590,7 +601,7 @@ case "$NS_TARGET" in /|*'/../'*|*'/./'*|*/..|*/.|*'//'*) return 1;;
 /*) case "$NS_TARGET" in *[!A-Za-z0-9_./+,@%:=~-]*) return 1;; esac;;
 *) return 1;; esac
 case "$NS_SERVICE" in ''|.|..|-*|*[!A-Za-z0-9_.-]*) return 1;; esac
-[ "$NS_SERVICE" = earnapp ] || { printf '%s\n' 'EARNAPP_SERVICE_REQUIRED' >&2; return 1; }
+case "$NS_SERVICE" in earnapp|kaleno|xray-runtime) :;; *) printf '%s\n' 'UNSUPPORTED_SERVICE_NAME' >&2; return 1;; esac
 if [ "$#" = 4 ]; then NS_HASH=$4; else NS_HASH=$(hash_file "$NS_TARGET") || return 1; fi
 case "$NS_HASH" in ''|*[!0-9a-f]*) return 1;; esac
 [ "${#NS_HASH}" = 64 ] || return 1
@@ -1673,7 +1684,7 @@ suite_table_owned(){
       if(ns==1 && s=="chain output {"){ns=2;return}
       if(ns==2 && (s=="type filter hook output priority -10; policy accept;" ||
                    s=="type filter hook output priority filter - 10; policy accept;")){ns=3;return}
-      if(table=="earnapp_maintenance" && service=="earnapp" && prefix=="earnapp-maintenance-")tag="earnapp-maintenance-v5"
+      if(table=="earnapp_maintenance" && (service=="earnapp" || service=="kaleno") && prefix=="earnapp-maintenance-")tag="earnapp-maintenance-v5"
       else if(table=="earnapp_limit" && service=="earnapp" && prefix=="earnapp-")tag="earnapp-v4"
       n=split(s,a," ")
       if(ns==3 && tag!="" && n==26 && a[1]=="socket" && a[2]=="cgroupv2" && a[3]=="level" &&
@@ -2227,36 +2238,1946 @@ suite_resume_pause(){
   done < "$U_D/resume.manifest"
 }
 
+# Source module: maintenance-naming-module.sh
+# Explicit custom names for EarnApp. Original SDK, identity, logs and records remain.
+NAMING_VERSION=2026.10.19.1
+MAIN_SERVICE=kaleno
+MAIN_PROGRAM=/usr/local/lib/vesari
+NAMING_SERVICE=$MAIN_SERVICE
+NAMING_PROGRAM=$MAIN_PROGRAM
+NAMING_REGISTRY=/var/lib/earnapp-maintenance/naming-current
+
+naming_alias_path(){
+  case "$1" in
+    program) printf '%s\n' "$MAIN_PROGRAM";;
+    init) printf '/etc/init.d/%s\n' "$MAIN_SERVICE";;
+    conf) printf '/etc/conf.d/%s\n' "$MAIN_SERVICE";;
+    *) fail 'invalid naming alias file';;
+  esac
+}
+naming_targets_absent(){
+  for NA_TAG in program init conf; do
+    NA_PATH=$(naming_alias_path "$NA_TAG") || return 1
+    suite_regular "$NA_PATH" || return 1
+    ! exists "$NA_PATH" || { fail "custom-name destination already exists: $NA_PATH"; return 1; }
+  done
+  for NA_PATH in "/etc/conf.d/$MAIN_SERVICE".* /etc/runlevels/*/"$MAIN_SERVICE"; do
+    ! exists "$NA_PATH" || { fail "custom-name service entry already exists: $NA_PATH"; return 1; }
+  done
+  suite_regular "$NAMING_REGISTRY" && ! exists "$NAMING_REGISTRY" || { fail 'naming registry already exists or is not a safe file target'; return 1; }
+}
+naming_lock(){
+  mkdir /run/earnapp-maintenance.setup.lock || { fail 'another maintenance operation or stale setup lock exists'; return 1; }
+  N_DIR_LOCKED=1
+  exec 8>/run/earnapp-maintenance.lockfile
+  flock -n 8 || { fail 'another maintenance operation is running'; return 1; }
+  exec 6>/run/earnapp-setup.lockfile
+  flock -n 6 || { fail 'the legacy installer is still running'; return 1; }
+}
+naming_publish_new(){
+  # Linking a same-directory temporary copy creates an absent destination only.
+  # Unlike mv -f, this cannot overwrite a target appearing after preflight.
+  NP_DEST=$1; NP_SOURCE=$2; NP_MODE=$3
+  suite_regular "$NP_DEST" && ! exists "$NP_DEST" || return 1
+  mkdir -p "$(dirname "$NP_DEST")" || return 1
+  NP_TEMP=$(mktemp "$(dirname "$NP_DEST")/.earnapp-maintenance-name-XXXXXXXX") || return 1
+  if ! cp -p "$NP_SOURCE" "$NP_TEMP" || ! chmod "$NP_MODE" "$NP_TEMP" || ! ln "$NP_TEMP" "$NP_DEST"; then
+    rm -f "$NP_TEMP"; return 1
+  fi
+  rm -f "$NP_TEMP"
+}
+naming_emit_init(){
+  awk -v program="$MAIN_PROGRAM" -v service="$MAIN_SERVICE" '
+    /^[[:space:]]*command=/{print "command=\"" program "\"";next}
+    /^[[:space:]]*name=/{print "name=\"" service "\"";named=1;next}
+    {print}
+    END{if(!named)print "name=\"" service "\""}' "$U_B/files/source-init"
+}
+naming_seal(){
+  : > "$U_B/naming.metadata" || return 1
+  for NM_FILE in naming.settings alias.manifest owned; do
+    NM_HASH=$(hash_file "$U_B/$NM_FILE") || return 1
+    printf '%s %s\n' "$NM_FILE" "$NM_HASH" >> "$U_B/naming.metadata" || return 1
+  done
+}
+naming_load(){
+  valid_path "$U_B" && [ -d "$U_B" ] && [ ! -L "$U_B" ] || return 1
+  for NL_FILE in naming.metadata naming.settings alias.manifest owned naming.state; do
+    suite_regular "$U_B/$NL_FILE" && [ -f "$U_B/$NL_FILE" ] || return 1
+  done
+  NL_SEEN=' '; NL_COUNT=0
+  while read -r NL_FILE NL_HASH NL_EXTRA; do
+    [ -z "$NL_EXTRA" ] || return 1
+    case "$NL_FILE" in naming.settings|alias.manifest|owned) :;; *) return 1;; esac
+    case "$NL_SEEN" in *" $NL_FILE "*) return 1;; esac
+    NL_SEEN="$NL_SEEN$NL_FILE "; NL_COUNT=$((NL_COUNT+1))
+    [ "$(hash_file "$U_B/$NL_FILE")" = "$NL_HASH" ] || { fail 'naming backup metadata changed'; return 1; }
+  done < "$U_B/naming.metadata"
+  [ "$NL_COUNT" = 3 ] || return 1
+  N_SOURCE=; N_HASH=; N_ID=; N_UUID=; N_BASE=; N_CURRENT_VERSION=
+  NL_SEEN=' '; NL_COUNT=0
+  while IFS='=' read -r NL_KEY NL_VALUE; do
+    case "$NL_SEEN" in *" $NL_KEY "*) return 1;; esac
+    NL_SEEN="$NL_SEEN$NL_KEY "; NL_COUNT=$((NL_COUNT+1))
+    case "$NL_KEY" in
+      FORMAT) [ "$NL_VALUE" = 1 ] || return 1;;
+      VERSION) N_CURRENT_VERSION=$NL_VALUE;;
+      SERVICE) [ "$NL_VALUE" = "$MAIN_SERVICE" ] || return 1;;
+      PROGRAM) [ "$NL_VALUE" = "$MAIN_PROGRAM" ] || return 1;;
+      SOURCE) N_SOURCE=$NL_VALUE;; HASH) N_HASH=$NL_VALUE;; DEVICE_ID) N_ID=$NL_VALUE;;
+      UUID_HASH) N_UUID=$NL_VALUE;; BASE_CURRENT) N_BASE=$NL_VALUE;;
+      *) return 1;;
+    esac
+  done < "$U_B/naming.settings"
+  [ "$NL_COUNT" = 9 ] && [ -n "$N_CURRENT_VERSION" ] && valid_path "$N_SOURCE" && valid_path "$N_BASE" || return 1
+  case "$N_HASH" in ''|*[!0-9a-f]*) return 1;; esac
+  [ "${#N_HASH}" = 64 ] && [ "$N_SOURCE" != "$MAIN_PROGRAM" ] || return 1
+  printf '%s\n' "$N_ID" | awk 'NR==1&&/^sdk-node-[0-9a-f]+$/&&length($0)==41{ok=1} END{exit !(ok&&NR==1)}' || return 1
+  case "$N_UUID" in absent) :;; *[!0-9a-f]*|'') return 1;; *) [ "${#N_UUID}" = 64 ] || return 1;; esac
+  [ "$(cat "$U_B/files/registry")" = "$N_BASE" ] || return 1
+  case "$(cat "$U_B/naming.state")" in prepared|switching|active|restoring|rolled-back|rollback-failed) :;; *) return 1;; esac
+  NL_SEEN=' '; NL_COUNT=0
+  while read -r NL_TAG NL_PRESENT NL_HASH NL_MODE NL_EXTRA; do
+    [ -z "$NL_EXTRA" ] || return 1
+    naming_alias_path "$NL_TAG" >/dev/null || return 1
+    case "$NL_SEEN" in *" $NL_TAG "*) return 1;; esac
+    NL_SEEN="$NL_SEEN$NL_TAG "; NL_COUNT=$((NL_COUNT+1))
+    case "$NL_TAG:$NL_PRESENT:$NL_MODE" in program:1:755|init:1:755|conf:1:644) :;; conf:0:-) [ "$NL_HASH" = - ] || return 1; continue;; *) return 1;; esac
+    case "$NL_HASH" in ''|*[!0-9a-f]*) return 1;; esac
+    [ "${#NL_HASH}" = 64 ] || return 1
+  done < "$U_B/alias.manifest"
+  [ "$NL_COUNT" = 3 ]
+}
+naming_check_aliases(){
+  NC_REQUIRED=${1:-0}
+  while read -r NC_TAG NC_PRESENT NC_HASH NC_MODE; do
+    NC_PATH=$(naming_alias_path "$NC_TAG") || return 1
+    suite_regular "$NC_PATH" || return 1
+    if exists "$NC_PATH"; then
+      [ "$NC_PRESENT" = 1 ] && [ "$(stat -c %a "$NC_PATH")" = "$NC_MODE" ] && [ "$(hash_file "$NC_PATH")" = "$NC_HASH" ] || { fail "custom-name file changed; retained: $NC_PATH"; return 1; }
+    else
+      [ "$NC_REQUIRED:$NC_PRESENT" != 1:1 ] || { fail "custom-name file is missing: $NC_PATH"; return 1; }
+    fi
+  done < "$U_B/alias.manifest"
+}
+naming_check_originals(){
+  [ "$(hash_file "$N_SOURCE")" = "$N_HASH" ] || { fail 'original SDK changed; naming operation refused'; return 1; }
+  for NO_TAG in source-init source-conf; do
+    NO_PATH=$(suite_path "$NO_TAG") || return 1
+    NO_ROW=$(awk -v tag="$NO_TAG" '$1==tag{print}' "$U_B/files.manifest") || return 1
+    set -- $NO_ROW; [ "$#" = 4 ] || return 1
+    if [ "$2" = 1 ]; then
+      suite_regular "$NO_PATH" && [ -f "$NO_PATH" ] && [ "$(hash_file "$NO_PATH")" = "$3" ] && [ "$(stat -c %a "$NO_PATH")" = "$4" ] || { fail 'original service file changed; retained without execution'; return 1; }
+    else ! exists "$NO_PATH" || return 1; fi
+  done
+  [ "$(cat "$SUITE_REGISTRY")" = "$N_BASE" ] || { fail 'base maintenance registry changed'; return 1; }
+  [ "$(suite_identity "$N_SOURCE")" = "$N_ID" ] || return 1
+  if [ "$N_UUID" = absent ]; then ! exists /etc/earnapp/uuid || return 1
+  else [ "$(hash_file /etc/earnapp/uuid)" = "$N_UUID" ] || { fail 'device UUID changed'; return 1; }; fi
+}
+naming_check_registry(){
+  suite_regular "$NAMING_REGISTRY" || return 1
+  ! exists "$NAMING_REGISTRY" || [ "$(cat "$NAMING_REGISTRY")" = "$U_B" ] || { fail 'another naming transaction owns the current registry'; return 1; }
+}
+naming_saved_worker() (
+  exec 6>&- 7>&- 8>&- 9>&-
+  . "$U_B/files/common" || exit 1
+  worker_snapshot
+)
+naming_alias_worker() (
+  exec 6>&- 7>&- 8>&- 9>&-
+  if [ -f "$U_B/staged/common" ]; then
+    [ "$(hash_file "$U_B/staged/common")" = "$(awk '$1=="common"{print $2}' "$U_B/owned")" ] || exit 1
+    . "$U_B/staged/common" || exit 1
+  else exit 1; fi
+  worker_snapshot
+)
+naming_alias_stop_identity() (
+  # A failed start can leave a fully owned supervisor/child under an inactive
+  # flag. This profile proves identity only for stopping this transaction; it
+  # never treats that contradictory flag as a healthy service.
+  exec 6>&- 7>&- 8>&- 9>&-
+  [ -f "$U_B/alias-start-attempted" ] && naming_check_aliases 1 || exit 1
+  [ "$(hash_file "$U_B/staged/common")" = "$(awk '$1=="common"{print $2}' "$U_B/owned")" ] || exit 1
+  . "$U_B/staged/common" || exit 1
+  NI_REAL_STATE=$(service_state "$MAIN_SERVICE") || exit 1
+  case "$NI_REAL_STATE" in 0|32) :;; *) exit 1;; esac
+  runtime_service_state(){ printf '%s\n' 0; }
+  NI_KEY=$(worker_snapshot) || exit 1
+  [ "$(service_state "$MAIN_SERVICE")" = "$NI_REAL_STATE" ] || exit 1
+  printf '%s\n' "$NI_KEY"
+)
+naming_alias_no_processes() (
+  # Separately prove absence when a failed start left a started flag without
+  # metadata. Keep every metadata, executable, parent and orphan check intact.
+  exec 6>&- 7>&- 8>&- 9>&-
+  [ -f "$U_B/alias-start-attempted" ] && naming_check_aliases 1 || exit 1
+  [ "$(hash_file "$U_B/staged/common")" = "$(awk '$1=="common"{print $2}' "$U_B/owned")" ] || exit 1
+  . "$U_B/staged/common" || exit 1
+  NI_REAL_STATE=$(service_state "$MAIN_SERVICE") || exit 1
+  case "$NI_REAL_STATE" in 0|32) :;; *) exit 1;; esac
+  runtime_service_state(){ printf '%s\n' 32; }
+  NI_KEY=$(worker_snapshot) && [ -z "$NI_KEY" ] || exit 1
+  WS_CANON=$(readlink -f "$MAIN_PROGRAM") || exit 1
+  # Do not skip a supervisor: an empty child slot can otherwise still respawn.
+  runtime_no_orphans '' || exit 1
+  [ "$(service_state "$MAIN_SERVICE")" = "$NI_REAL_STATE" ] || exit 1
+)
+naming_source_stopped(){
+  [ "$(service_state earnapp 6>&- 7>&- 8>&- 9>&-)" = 3 ] || return 1
+  NS_KEY=$(naming_saved_worker) || return 1
+  [ -z "$NS_KEY" ] || { fail 'original EarnApp worker is still running'; return 1; }
+}
+naming_wait_source(){
+  NW_N=0
+  while [ "$NW_N" -lt 15 ]; do
+    NW_KEY=$(naming_saved_worker 2>/dev/null) && [ -n "$NW_KEY" ] && return 0
+    NW_N=$((NW_N+1)); [ "$NW_N" = 15 ] || sleep 1
+  done
+  fail 'original EarnApp worker did not become verifiable'
+}
+naming_wait_alias(){
+  NW_N=0
+  while [ "$NW_N" -lt 15 ]; do
+    NW_KEY=$(naming_alias_worker 2>/dev/null) && [ -n "$NW_KEY" ] && return 0
+    NW_N=$((NW_N+1)); [ "$NW_N" = 15 ] || sleep 1
+  done
+  fail 'custom-name EarnApp worker did not become verifiable'
+}
+naming_levels_restore(){
+  NR_SERVICE=$1; NR_FILE=$2
+  NR_CURRENT=$(runlevels_for "$NR_SERVICE") || return 1
+  for NR_LEVEL in $NR_CURRENT; do
+    grep -Fxq "$NR_LEVEL" "$NR_FILE" || rc-update del "$NR_SERVICE" "$NR_LEVEL" 6>&- 7>&- 8>&- 9>&- || return 1
+  done
+  while IFS= read -r NR_LEVEL; do
+    valid_name "$NR_LEVEL" || return 1
+    exists "/etc/runlevels/$NR_LEVEL/$NR_SERVICE" || rc-update add "$NR_SERVICE" "$NR_LEVEL" 6>&- 7>&- 8>&- 9>&- || return 1
+  done < "$NR_FILE"
+}
+naming_verify_limiter(){
+  NV_SERVICE=$1; NV_KEY=$2; NV_PID=${NV_KEY%%:*}
+  suite_table_owned earnapp_maintenance "$NV_SERVICE" earnapp-maintenance- || return 1
+  NV_GROUP=$(awk -F: '$1==0{print $3}' "/proc/$NV_PID/cgroup") || return 1
+  valid_path "$NV_GROUP" && [ "${NV_GROUP##*/}" = "openrc.$NV_SERVICE" ] || return 1
+  NV_INODE=$(stat -Lc %i "/sys/fs/cgroup$NV_GROUP") || return 1
+  NV_EXPECTED="earnapp-maintenance-v5:$(uname -r):$NV_INODE:20:$NV_GROUP"
+  [ "$(cat /run/earnapp-maintenance/limit-key)" = "$NV_EXPECTED" ] || { fail 'limiter cache is not bound to the current service cgroup'; return 1; }
+  NV_TABLE=$(nft list table inet earnapp_maintenance) || return 1
+  NV_DIGEST=$(printf '%s\n' "$NV_TABLE" | sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/g' | sha256sum) || return 1
+  [ "$(cat /run/earnapp-maintenance/limit-digest)" = "${NV_DIGEST%% *}" ] || { fail 'limiter rules changed after verification'; return 1; }
+}
+naming_validate(){
+  naming_load && naming_check_originals && naming_check_aliases "${1:-0}" && naming_check_registry || return 1
+  SUITE_SERVICE=earnapp; SDK_BIN=$N_SOURCE
+  suite_validate_backup
+}
+naming_status(){
+  naming_validate 1 || return 1
+  [ "$(cat "$U_B/naming.state")" = active ] || { fail 'naming transaction is not active'; return 1; }
+  suite_check_owned "$U_B" || return 1
+  naming_source_stopped || return 1
+  SUITE_SERVICE=$MAIN_SERVICE; SDK_BIN=$MAIN_PROGRAM
+  suite_verify_runtime || return 1
+  NS_KEY=$(naming_alias_worker) && [ -n "$NS_KEY" ] || return 1
+  naming_verify_limiter "$MAIN_SERVICE" "$NS_KEY" || return 1
+  [ "$(suite_identity "$MAIN_PROGRAM")" = "$N_ID" ] || return 1
+  NS_LEVELS=$(runlevels_for "$MAIN_SERVICE") || return 1
+  printf '%s\n' "$NS_LEVELS" | awk 'NF' > "$U_D/levels.current" || return 1
+  cmp -s "$U_D/levels.current" "$U_B/earnapp.runlevels" || { fail 'custom-name runlevel activation changed'; return 1; }
+  [ -z "$(runlevels_for earnapp)" ] || { fail 'original source still has enabled runlevels'; return 1; }
+  grep -Fxq '*/2 * * * * /usr/local/sbin/selnu >/dev/null 2>&1 # EARNAPP-MAINT-WATCHDOG' /etc/crontabs/root || return 1
+  [ "$(service_state crond)" = 0 ] && exists /etc/runlevels/default/crond && exists /etc/runlevels/default/local || return 1
+  printf 'NAMING_STATE=COMPLETE\nNAMING_VERSION=%s\nAPPLICATION=EarnApp\nSERVICE=%s\nPROGRAM=%s\nSOURCE_PROGRAM=%s\nBACKUP=%s\n' "$N_CURRENT_VERSION" "$MAIN_SERVICE" "$MAIN_PROGRAM" "$N_SOURCE" "$U_B"
+}
+naming_restore_base() (
+  # The base restoration publishes cron last. Interpose only that last tag so
+  # a freshly recreated source cgroup receives fresh rules before jobs resume.
+  suite_restore_tag(){
+    if [ "$1" = cron ]; then
+      naming_wait_source && naming_check_originals || return 1
+      /usr/local/sbin/loren --locked 20 6>&- || return 1
+      RB_KEY=$(naming_saved_worker) && [ -n "$RB_KEY" ] || return 1
+      naming_verify_limiter earnapp "$RB_KEY" || return 1
+    fi
+    RB_ROW=$(awk -v tag="$1" '$1==tag{print}' "$U_B/files.manifest") || return 1
+    set -- $RB_ROW; [ "$#" = 4 ] || return 1
+    if [ "$2" = 1 ]; then suite_atomic "$1" "$U_B/files/$1" "$4"
+    else suite_remove "$1"; fi
+  }
+  SUITE_SERVICE=earnapp; SDK_BIN=$N_SOURCE
+  suite_restore_transaction
+)
+naming_table_owned(){
+  NT_TABLES=$(nft list tables) || return 1
+  if printf '%s\n' "$NT_TABLES" | grep -Fxq 'table inet earnapp_maintenance'; then
+    if ! suite_table_owned earnapp_maintenance "$MAIN_SERVICE" earnapp-maintenance- 2>/dev/null; then
+      suite_table_owned earnapp_maintenance earnapp earnapp-maintenance- || return 1
+    fi
+  fi
+  return 0
+}
+naming_clear_table(){
+  naming_table_owned || return 1
+  NT_TABLES=$(nft list tables) || return 1
+  if printf '%s\n' "$NT_TABLES" | grep -Fxq 'table inet earnapp_maintenance'; then
+    nft delete table inet earnapp_maintenance || return 1
+  fi
+}
+naming_restore_transaction(){
+  naming_validate 0 || { fail 'naming backup or current file ownership validation failed'; return 1; }
+  naming_table_owned || return 1
+  printf '%s\n' restoring > "$U_B/naming.state" || return 1
+  if exists "/etc/init.d/$MAIN_SERVICE"; then
+    naming_check_aliases 0 || return 1
+    NR_STATE=$(service_state "$MAIN_SERVICE" 6>&- 7>&- 8>&- 9>&-) || return 1
+    if ! NR_ALIAS_KEY=$(naming_alias_worker 2>/dev/null); then
+      if ! NR_ALIAS_KEY=$(naming_alias_stop_identity 2>/dev/null); then
+        naming_alias_no_processes || { fail 'custom-name runtime is unknown; source was not restarted'; return 1; }
+        NR_ALIAS_KEY=
+      fi
+    fi
+    [ "$(service_state "$MAIN_SERVICE" 6>&- 7>&- 8>&- 9>&-)" = "$NR_STATE" ] || return 1
+    case "$NR_STATE" in 0|32)
+      timeout -k 5 30 rc-service "$MAIN_SERVICE" stop 6>&- 7>&- 8>&- 9>&- || return 1;;
+      3) [ -z "$NR_ALIAS_KEY" ] || return 1;;
+      *) fail 'custom-name service is transitional; source was not restarted'; return 1;;
+    esac
+    NR_ALIAS_KEY=$(naming_alias_worker) && [ -z "$NR_ALIAS_KEY" ] || return 1
+    [ "$(service_state "$MAIN_SERVICE" 6>&- 7>&- 8>&- 9>&-)" = 3 ] || return 1
+  elif [ -f "$U_B/alias-start-attempted" ]; then
+    fail 'custom-name init missing after a start attempt; source was not restarted'; return 1
+  fi
+  # Keep live alias protection in place until its worker is proven absent.
+  naming_clear_table || return 1
+  : > "$U_D/no.runlevels"
+  naming_levels_restore "$MAIN_SERVICE" "$U_D/no.runlevels" || return 1
+  naming_check_originals || return 1
+  naming_levels_restore earnapp "$U_B/earnapp.runlevels" || return 1
+  NR_SOURCE_KEY=$(naming_saved_worker) || return 1
+  if [ -z "$NR_SOURCE_KEY" ]; then
+    NR_STATE=$(service_state earnapp 6>&- 7>&- 8>&- 9>&-) || return 1
+    case "$NR_STATE" in 3) :;; 32)
+      timeout -k 2 10 rc-service earnapp zap 6>&- 7>&- 8>&- 9>&- || return 1;;
+      *) fail 'original source state is unknown; no duplicate start attempted'; return 1;;
+    esac
+    timeout -k 5 30 rc-service earnapp start 6>&- 7>&- 8>&- 9>&- || return 1
+  fi
+  naming_wait_source || return 1
+  naming_restore_base || return 1
+  naming_check_aliases 0 || return 1
+  # Retire this guard only after the alias stopped and the source was restored.
+  # Cleanup may remove init before a later deletion fails; that must be retryable.
+  rm -f "$U_B/alias-start-attempted" || return 1
+  for NR_TAG in conf init program; do
+    NR_PATH=$(naming_alias_path "$NR_TAG") || return 1
+    ! exists "$NR_PATH" || rm -f "$NR_PATH" || return 1
+  done
+  naming_check_registry || return 1
+  ! exists "$NAMING_REGISTRY" || rm -f "$NAMING_REGISTRY" || return 1
+  printf '%s\n' rolled-back > "$U_B/naming.state" || return 1
+  printf 'NAMING_RESTORED\nAPPLICATION=EarnApp\nSERVICE=earnapp\nPROGRAM=%s\nBACKUP=%s\n' "$N_SOURCE" "$U_B"
+}
+naming_exit(){
+  NE_RC=$?
+  trap - 0 HUP INT TERM
+  if [ "$NE_RC" -ne 0 ] && [ "${N_TX:-0}" = 1 ]; then
+    printf 'Naming failed; restoring the recorded EarnApp maintenance baseline: %s\n' "$U_B" >&2
+    if ! naming_restore_transaction; then
+      printf '%s\n' rollback-failed > "$U_B/naming.state"
+      printf 'FAIL: naming recovery needs review; cron/records retained: %s\n' "$U_B" >&2
+    fi
+  elif [ "$NE_RC" -ne 0 ] && [ "${N_RESTORE_PHASE:-}" = quiesce ]; then
+    suite_resume_pause || printf 'FAIL: paused entry restoration needs review: %s\n' "$U_D" >&2
+  fi
+  if [ "$NE_RC" = 0 ]; then
+    [ -z "${U_D:-}" ] || rm -rf "$U_D"
+  else printf 'Naming diagnostic files retained: %s\n' "${U_D:-none}" >&2; fi
+  [ "${N_DIR_LOCKED:-0}" = 0 ] || rmdir /run/earnapp-maintenance.setup.lock 2>/dev/null || true
+  exit "$NE_RC"
+}
+cmd_named_install() (
+  umask 077
+  require_root || exit 1
+  if exists "$NAMING_REGISTRY"; then
+    U_B=$(cat "$NAMING_REGISTRY") || exit 1
+    U_D=$(mktemp -d /tmp/earnapp-maintenance-naming-status-XXXXXXXX) || exit 1
+    N_TX=0; N_DIR_LOCKED=0
+    trap naming_exit 0
+    naming_status || exit 1
+    printf 'ALREADY_CURRENT\n%s\n' "$NAMING_VERSION"
+    exit 0
+  fi
+  naming_targets_absent || exit 1
+  if [ "$APPLY" != 1 ]; then
+    cmd_suite_install || exit "$?"
+    printf '[dry-run] then assign EarnApp service=%s program=%s, preserving the original SDK and identity.\n' "$MAIN_SERVICE" "$MAIN_PROGRAM"
+    exit 0
+  fi
+  U_D=$(mktemp -d /tmp/earnapp-maintenance-naming-XXXXXXXX) || exit 1
+  N_TX=0; N_DIR_LOCKED=0; N_RESTORE_PHASE=
+  trap naming_exit 0
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  NB_RC=0
+  cmd_suite_install > "$U_D/base-install.log" 2>&1 || NB_RC=$?
+  if [ "$NB_RC" != 0 ]; then cat "$U_D/base-install.log"; exit "$NB_RC"; fi
+  printf '%s\n' 'BASE_MAINTENANCE_READY; completing the requested custom names.'
+  naming_lock || exit 1
+  naming_targets_absent || exit 1
+  SUITE_SERVICE=earnapp
+  suite_read_current || exit 1
+  [ "$U_CURRENT_VERSION" = "$SUITE_VERSION" ] || { fail 'base maintenance version is not current'; exit 1; }
+  SDK_BIN=$U_TARGET; N_SOURCE=$SDK_BIN; N_BASE=$U_PREVIOUS
+  [ "$(od -An -tx1 -N4 "$SDK_BIN" | tr -d ' \n')" = 7f454c46 ] || { fail 'custom-name program requires the original ELF SDK'; exit 1; }
+  cmd_suite_status > "$U_D/base-status.log" 2>&1 || { cat "$U_D/base-status.log"; exit 1; }
+  N_HASH=$(hash_file "$SDK_BIN") && N_ID=$(suite_identity "$SDK_BIN") || exit 1
+  N_UUID=absent
+  [ ! -e /etc/earnapp/uuid ] || N_UUID=$(hash_file /etc/earnapp/uuid) || exit 1
+  U_MODE=managed
+  U_B=$(mktemp -d "$BACKUP_ROOT/earnapp-maintenance-naming-$(date -u +%Y%m%d-%H%M%S)-XXXXXXXX") || exit 1
+  suite_snapshot || exit 1
+  cp "$U_D/base-install.log" "$U_B/base-install.log" || exit 1
+  printf '%s\n' 'FORMAT=1' "VERSION=$NAMING_VERSION" "SERVICE=$MAIN_SERVICE" "PROGRAM=$MAIN_PROGRAM" \
+    "SOURCE=$N_SOURCE" "HASH=$N_HASH" "DEVICE_ID=$N_ID" "UUID_HASH=$N_UUID" "BASE_CURRENT=$N_BASE" > "$U_B/naming.settings" || exit 1
+  mkdir "$U_B/staged" || exit 1
+  cp -p "$SDK_BIN" "$U_B/staged/program" || exit 1
+  [ "$(hash_file "$U_B/staged/program")" = "$N_HASH" ] || exit 1
+  naming_emit_init > "$U_B/staged/init" || exit 1
+  chmod 755 "$U_B/staged/init" || exit 1
+  (OLD_SVC=$MAIN_SERVICE; SDK_BIN=$MAIN_PROGRAM; suite_source_init_valid "$U_B/staged/init") || exit 1
+  : > "$U_B/alias.manifest"
+  for NI_TAG in program init; do
+    NI_HASH=$(hash_file "$U_B/staged/$NI_TAG") || exit 1
+    printf '%s 1 %s 755\n' "$NI_TAG" "$NI_HASH" >> "$U_B/alias.manifest" || exit 1
+  done
+  if [ -f "$U_B/files/source-conf" ]; then
+    cp -p "$U_B/files/source-conf" "$U_B/staged/conf" || exit 1
+    NI_HASH=$(hash_file "$U_B/staged/conf") || exit 1
+    printf 'conf 1 %s 644\n' "$NI_HASH" >> "$U_B/alias.manifest" || exit 1
+  else printf '%s\n' 'conf 0 - -' >> "$U_B/alias.manifest" || exit 1; fi
+  suite_stage_helpers "$U_B/staged" "$MAIN_PROGRAM" "$MAIN_SERVICE" "$N_HASH" || exit 1
+  : > "$U_B/owned"
+  for NI_TAG in common watchdog recover limit boot; do
+    sh -n "$U_B/staged/$NI_TAG" || exit 1
+    NI_HASH=$(hash_file "$U_B/staged/$NI_TAG") || exit 1
+    printf '%s %s\n' "$NI_TAG" "$NI_HASH" >> "$U_B/owned" || exit 1
+  done
+  printf '%s\n' prepared > "$U_B/naming.state" || exit 1
+  naming_seal && naming_validate 0 || exit 1
+  printf 'Naming backup: %s\n' "$U_B"
+  N_TX=1
+  suite_pause || exit 1
+  printf '%s\n' switching > "$U_B/naming.state" || exit 1
+  for NI_TAG in program init conf; do
+    [ -f "$U_B/staged/$NI_TAG" ] || continue
+    NI_PATH=$(naming_alias_path "$NI_TAG") || exit 1
+    NI_MODE=755; [ "$NI_TAG" != conf ] || NI_MODE=644
+    naming_publish_new "$NI_PATH" "$U_B/staged/$NI_TAG" "$NI_MODE" || exit 1
+  done
+  [ "$(suite_identity "$MAIN_PROGRAM")" = "$N_ID" ] || { fail 'custom program has a different device identity'; exit 1; }
+  naming_check_originals || exit 1
+  printf '%s\n' attempted > "$U_B/source-stop-attempted" || exit 1
+  timeout -k 5 30 rc-service earnapp stop 6>&- 7>&- 8>&- 9>&- || exit 1
+  naming_source_stopped || exit 1
+  : > "$U_D/no.runlevels"
+  naming_levels_restore earnapp "$U_D/no.runlevels" || exit 1
+  naming_clear_table || exit 1
+  for NI_TAG in common watchdog recover limit boot; do
+    NI_MODE=755; [ "$NI_TAG" != common ] || NI_MODE=644
+    suite_atomic "$NI_TAG" "$U_B/staged/$NI_TAG" "$NI_MODE" || exit 1
+  done
+  naming_levels_restore "$MAIN_SERVICE" "$U_B/earnapp.runlevels" || exit 1
+  printf '%s\n' attempted > "$U_B/alias-start-attempted" || exit 1
+  timeout -k 5 30 rc-service "$MAIN_SERVICE" start 6>&- 7>&- 8>&- 9>&- || exit 1
+  naming_wait_alias || exit 1
+  SUITE_SERVICE=$MAIN_SERVICE; SDK_BIN=$MAIN_PROGRAM
+  suite_verify_runtime || exit 1
+  /usr/local/sbin/loren --locked 20 6>&- || exit 1
+  NI_KEY=$(naming_alias_worker) && [ -n "$NI_KEY" ] || exit 1
+  naming_verify_limiter "$MAIN_SERVICE" "$NI_KEY" && naming_check_originals || exit 1
+  suite_restore_tag cron || exit 1
+  printf '%s\n' "$U_B" > "$U_D/naming-current" || exit 1
+  naming_publish_new "$NAMING_REGISTRY" "$U_D/naming-current" 600 || exit 1
+  printf '%s\n' active > "$U_B/naming.state" || exit 1
+  naming_status || exit 1
+  N_TX=0
+  printf 'INSTALL_STATE=COMPLETE\nNAMING_VERSION=%s\nAPPLICATION=EarnApp\nSERVICE=%s\nPROGRAM=%s\nSOURCE_PROGRAM=%s\nDEVICE_ID=%s\nBACKUP=%s\n' "$NAMING_VERSION" "$MAIN_SERVICE" "$MAIN_PROGRAM" "$N_SOURCE" "$N_ID" "$U_B"
+)
+cmd_named_status() (
+  umask 077
+  require_root || exit 1
+  suite_regular "$NAMING_REGISTRY" && [ -s "$NAMING_REGISTRY" ] || { fail 'custom naming has not completed'; exit 1; }
+  U_B=$(cat "$NAMING_REGISTRY") || exit 1
+  U_D=$(mktemp -d /tmp/earnapp-maintenance-naming-status-XXXXXXXX) || exit 1
+  N_TX=0; N_DIR_LOCKED=0
+  trap naming_exit 0
+  naming_status
+)
+cmd_named_precheck() (
+  umask 077
+  if exists "$NAMING_REGISTRY"; then cmd_named_status
+  else naming_targets_absent && suite_preflight; fi
+)
+cmd_named_restore() (
+  umask 077
+  require_root || exit 1
+  if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/naming.settings" ]; then U_B=$BACKUP_DIR
+  elif exists "$NAMING_REGISTRY"; then
+    [ -z "$BACKUP_DIR" ] || { fail 'restore the active naming transaction before selecting a base backup'; exit 1; }
+    U_B=$(cat "$NAMING_REGISTRY") || exit 1
+  else cmd_suite_restore; exit "$?"; fi
+  U_D=$(mktemp -d /tmp/earnapp-maintenance-naming-restore-XXXXXXXX) || exit 1
+  N_TX=0; N_DIR_LOCKED=0; N_RESTORE_PHASE=prepare
+  trap naming_exit 0
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  naming_validate 0 || exit 1
+  if [ "$(cat "$U_B/naming.state")" = rolled-back ]; then
+    naming_targets_absent && cmd_suite_status || exit 1
+    printf '%s\n' 'Already restored to the original EarnApp maintenance baseline.'
+    exit 0
+  fi
+  if [ "$APPLY" != 1 ]; then
+    printf '[dry-run] restore the original EarnApp service, helpers, activation and fresh cgroup limiter from %s\n' "$U_B"
+    exit 0
+  fi
+  naming_lock || exit 1
+  naming_validate 0 && suite_save_pause || exit 1
+  N_RESTORE_PHASE=quiesce
+  suite_pause || exit 1
+  N_RESTORE_PHASE=restore
+  naming_restore_transaction || { printf '%s\n' rollback-failed > "$U_B/naming.state"; exit 1; }
+)
+
 usage(){
   printf 'usage: sh %s <install|precheck|status|restore|names> [--apply]\n' "$0"
-  printf '%s\n' 'EarnApp keeps its actual service name and program path.'
-  printf '%s\n' 'install --apply installs if absent or upgrades recognized auxiliary scripts.'
+  printf '%s\n' 'EarnApp runs as service kaleno using /usr/local/lib/vesari.'
+  printf '%s\n' 'install --apply installs if absent, upgrades recognized maintenance and migrates the main service.'
   printf '%s\n' 'precheck is read-only; status verifies the active maintenance installation.'
-  printf '%s\n' 'restore --apply restores the recorded auxiliary configuration.'
+  printf '%s\n' 'restore --apply restores the service and maintenance state recorded before naming.'
   printf '%s\n' 'Vendor installation/source preparation is retained as a separate foundation.'
   printf '%s\n' 'BACKUP_DIR selects an exact maintenance backup; BACKUP_ROOT sets its parent.'
   printf '%s\n' 'Configuration: /etc/earnapp/maintenance.conf; log: /var/log/earnapp-maintenance.log'
 }
 cmd_names(){
-  printf 'APPLICATION=EarnApp\nSERVICE=earnapp\n'
+  printf 'APPLICATION=EarnApp\nVERSION=%s\nSERVICE=%s\nPROGRAM=%s\n' "$NAMING_VERSION" "$NAMING_SERVICE" "$NAMING_PROGRAM"
+  printf 'SOURCE_SERVICE=earnapp\nSOURCE_PROGRAM=/usr/bin/earnapp\n'
   for MN_ROLE in common watchdog recover limit boot config registry; do
     printf '%s=%s\n' "$MN_ROLE" "$(suite_path "$MN_ROLE")" || return 1
   done
   printf '%s\n' 'log=/var/log/earnapp-maintenance.log'
+  printf 'naming_registry=%s\n' "$NAMING_REGISTRY"
 }
-case "$CMD" in
-  install|upgrade|setup) cmd_suite_install;;
-  precheck) suite_preflight;;
-  status) cmd_suite_status;;
-  restore) cmd_suite_restore;;
-  names) cmd_names;;
-  -h|--help|help) usage;;
-  *) usage; exit 1;;
-esac
-MAINT_RC=$?
-[ "$MAINT_RC" = 0 ] || exit "$MAINT_RC"
-case "$CMD:$APPLY" in
-  install:0|upgrade:0|setup:0|restore:0|precheck:*) printf '%s\n' '== SUCCESS (read-only) ==';;
-  *) printf '%s\n' '== SUCCESS ==';;
-esac
-exit 0
+
+# Private runtime for the pinned, unmodified-source EarnApp SDK, Alpine x86_64.
+# xray is an SDK copy with a bounded interpreter-field edit, not an Xray binary.
+KR_VERSION=2026.10.19.2
+KR_SERVICE=xray-runtime
+KR_HOME=/opt/xray-runtime
+KR_PROGRAM=/opt/xray-runtime/xray
+KR_STATE=/run/xray-runtime
+KR_WORKER_LOCK=/run/xray-runtime.worker.lockfile
+KR_SETUP_LOCK=/run/xray-runtime.setup.lock
+KR_LOG=/var/log/xray-runtime.log
+KR_CONFIG=/etc/xray-runtime/maintenance.conf
+KR_REGISTRY=/var/lib/xray-runtime/current
+KR_TABLE=xray_runtime
+KR_TAG=xray-runtime-v6
+KR_CRON_MARK=XRAY-RUNTIME-WATCHDOG
+KR_ENTRY=/usr/local/sbin/xray-maintenance
+KR_BACKUP_PREFIX=/var/backups/xray-runtime-
+KR_SDK_SHA=a5080f9eff9df9f59a2192ccafc344f06259bfffe2a0aee619d44c8cafbd8def
+KR_PATCHED_SHA=2868366c22c73f151682097f3774cb04fb6a001076ff43fd67942111c97ab9bb
+KR_SDK_URL=https://cdn-earnapp.b-cdn.net/static/earnapp-x64-1.665.73
+
+kr_error() { printf 'FAIL: runtime: %s\n' "$*" >&2; return 1; }
+
+# Refuse symlinks in every existing component, including the requested leaf.
+kr_plain_path() (
+  [ "$#" = 1 ] && valid_path "$1" || exit 1
+  kr_check=$1
+  while [ "$kr_check" != / ]; do
+    [ ! -L "$kr_check" ] || exit 1
+    kr_check=${kr_check%/*}; [ -n "$kr_check" ] || kr_check=/
+  done
+)
+
+kr_platform_supported() {
+  [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] &&
+    [ -f /etc/alpine-release ] && [ ! -L /etc/alpine-release ] ||
+    kr_error 'only Alpine Linux x86_64 is supported'
+}
+
+kr_sdk() (
+  [ "$#" -ge 1 ] || exit 1
+  kr_program=$1; shift
+  kr_plain_path "$kr_program" && [ -f "$kr_program" ] && [ -x "$kr_program" ] || exit 1
+  kr_lib=${kr_program%/*}/lib
+  kr_plain_path "$kr_lib" && [ -d "$kr_lib" ] || exit 1
+  # CLI queries are bounded and cannot retain transaction locks. The steady
+  # worker is launched directly by OpenRC, independently of this query interface.
+  exec 5>&- 6>&- 7>&- 8>&- 9>&-
+  exec timeout -k 2 15 env LD_LIBRARY_PATH="$kr_lib" "$kr_program" "$@"
+)
+
+kr_emit_config() (
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || exit 1
+  kr_out=$1; kr_old=${2:-}
+  kr_plain_path "$kr_out" && [ ! -d "$kr_out" ] || exit 1
+  if [ -n "$kr_old" ]; then
+    kr_plain_path "$kr_old" && [ -f "$kr_old" ] && [ -r "$kr_old" ] || exit 1
+    # Do not source configuration. Unknown keys, duplicates and shell expressions stop.
+    awk '
+      /^[[:space:]]*$/ || /^[[:space:]]*#/ {next}
+      /^(UDP_THRESHOLD|FD_THRESHOLD|RSS_THRESHOLD_KB|ZERO_MAX_BAD|RESOURCE_MAX_BAD|MIN_UPTIME|RESTART_COOLDOWN)=[1-9][0-9]*$/ {
+        split($0,a,"="); if(a[2]+0<=2147483647 && !seen[a[1]]++)next
+      }
+      {bad=1} END{exit bad}' "$kr_old" || { kr_error 'invalid explicit maintenance configuration'; exit 1; }
+  fi
+  kr_tmp=$(mktemp "${kr_out%/*}/.maintenance-conf.XXXXXX") || exit 1
+  trap 'rm -f "$kr_tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  awk '
+    BEGIN {
+      n=split("UDP_THRESHOLD FD_THRESHOLD RSS_THRESHOLD_KB ZERO_MAX_BAD RESOURCE_MAX_BAD MIN_UPTIME RESTART_COOLDOWN",keys," ")
+      split("250 512 184320 2 3 300 900",defaults," ")
+      for(i=1;i<=n;i++)value[keys[i]]=defaults[i]
+    }
+    /^[A-Z_]+=[1-9][0-9]*$/ {split($0,a,"=");value[a[1]]=a[2]}
+    END {for(i=1;i<=n;i++)print keys[i] "=" value[keys[i]]}
+  ' ${kr_old:+"$kr_old"} </dev/null >"$kr_tmp" || exit 1
+  chmod 644 "$kr_tmp" && mv "$kr_tmp" "$kr_out" || exit 1
+  if [ -n "$kr_old" ]; then
+    awk '/^[A-Z_]+=[1-9][0-9]*$/ {split($0,a,"=");printf "CONFIG_OVERRIDE %s=%s\n",a[1],a[2]}' "$kr_old" >&2
+  fi
+)
+
+kr_emit_init() {
+  cat <<'KR_OPENRC_INIT'
+#!/sbin/openrc-run
+# XRAY-RUNTIME-MAINTENANCE-2026.10.19.2; private EarnApp SDK runtime.
+name="xray-runtime"
+description="Private application runtime"
+command="/opt/xray-runtime/xray"
+command_args="run"
+command_user="root"
+supervisor="supervise-daemon"
+supervise_daemon_args="--env LD_LIBRARY_PATH=/opt/xray-runtime/lib"
+pidfile="/run/xray-runtime.supervisor.pid"
+respawn_delay=5
+respawn_max=0
+respawn_period=1800
+depend() { need net; }
+start_pre() {
+  [ -f /etc/earnapp/registered ] && [ ! -L /etc/earnapp/registered ] && [ -s /etc/earnapp/registered ]
+}
+KR_OPENRC_INIT
+}
+
+kr_stage_helpers() (
+  [ "$#" = 2 ] && kr_plain_path "$1" || exit 1
+  kr_dir=$1; kr_hash=$2
+  case "$kr_hash" in ''|*[!0-9a-f]*) exit 1;; esac
+  [ "${#kr_hash}" = 64 ] || exit 1
+  [ ! -e "$kr_dir" ] || { [ -d "$kr_dir" ] && [ -z "$(ls -A "$kr_dir")" ]; } || exit 1
+  suite_stage_helpers "$kr_dir" "$KR_PROGRAM" "$KR_SERVICE" "$kr_hash" || exit 1
+  for kr_name in common watchdog recover limit boot; do
+    kr_file=$kr_dir/$kr_name
+    [ -f "$kr_file" ] && [ ! -L "$kr_file" ] || exit 1
+    sed \
+      -e 's/EARNAPP-MAINTENANCE-2026\.10\.18\.2/XRAY-RUNTIME-MAINTENANCE-2026.10.19.2/g' \
+      -e 's|/etc/earnapp/maintenance\.conf|/etc/xray-runtime/maintenance.conf|g' \
+      -e 's/earnapp-maintenance-v5/xray-runtime-v6/g' \
+      -e 's/earnapp-maintenance/xray-runtime/g' \
+      -e 's/earnapp_maintenance/xray_runtime/g' \
+      -e 's/earnapp_probe_/xray_runtime_probe_/g' \
+      -e 's|timeout -k 2 15 "\$APP_BIN" status|timeout -k 2 15 env LD_LIBRARY_PATH=/opt/xray-runtime/lib "$APP_BIN" status|' \
+      -e '/^sdk_state() {$/a\
+[ -f /etc/earnapp/registered ] && [ ! -L /etc/earnapp/registered ] && [ -s /etc/earnapp/registered ] || { printf '\''unregistered\\n'\''; return 0; }' \
+      -e 's/disabled) log SDK_DISABLED; exit 0;;/unregistered) log SDK_UNREGISTERED; exit 0;; disabled) log SDK_DISABLED; exit 0;;/' \
+      -e 's/disabled) log SDK_DISABLED; exit 1;;/unregistered) log SDK_UNREGISTERED; exit 1;; disabled) log SDK_DISABLED; exit 1;;/' \
+      "$kr_file" >"$kr_file.next" || exit 1
+    mv "$kr_file.next" "$kr_file" || exit 1
+  done
+  # A mapping-only match is retained for legacy recognition in legacy-core,
+  # but never accepted as the canonical worker: /proc/exe must be the SDK itself.
+  awk '
+    /if \[ "\$WS_MATCH" = 0 \] && mapped_program_matches "\/proc\/\$WS_CHILD"/ {
+      print "[ \"$WS_CHILD_EXE\" = \"$WS_CANON\" ] || ws_unknown child_executable"
+      print "[ \"$(cat \"/proc/$WS_CHILD/comm\" 2>/dev/null)\" = xray ] || ws_unknown child_name"
+      print "tr '\''\\000'\'' '\''\\n'\'' <\"/proc/$WS_CHILD/cmdline\" | awk -v program=\"$WS_CANON\" '\''NR==1{first=($0==program)} NR==2{second=($0==\"run\")} END{exit !(NR==2&&first&&second)}'\'' || ws_unknown child_arguments"
+      next
+    }
+    {print}
+  ' "$kr_dir/common" >"$kr_dir/common.next" || exit 1
+  mv "$kr_dir/common.next" "$kr_dir/common" || exit 1
+  for kr_name in common watchdog recover limit boot; do sh -n "$kr_dir/$kr_name" || exit 1; done
+  chmod 644 "$kr_dir/common" && chmod 755 "$kr_dir/watchdog" "$kr_dir/recover" "$kr_dir/limit" "$kr_dir/boot"
+)
+
+# Little endian fields are read as decimal bytes, avoiding host-endian assumptions.
+kr_elf_uint() (
+  kr_bytes=$(od -An -v -tu1 -j "$2" -N "$3" "$1") || exit 1
+  printf '%s\n' "$kr_bytes" | awk -v count="$3" '
+    BEGIN{v=0;m=1;n=0}
+    {for(i=1;i<=NF;i++){if($i!~/^[0-9]+$/||$i>255)exit 1;v+=$i*m;m*=256;n++}}
+    END{if(n!=count||v>9007199254740991)exit 1;printf "%.0f\n",v}'
+)
+
+kr_sdk_elf_valid() (
+  kr_sdk_file=$1
+  [ "$(hash_file "$kr_sdk_file")" = "$KR_SDK_SHA" ] || { kr_error 'unknown SDK bytes; refusing interpreter patch'; exit 1; }
+  [ "$(od -An -v -tx1 -N 6 "$kr_sdk_file" | tr -d ' \n')" = 7f454c460201 ] || exit 1
+  [ "$(kr_elf_uint "$kr_sdk_file" 18 2)" = 62 ] || exit 1
+  kr_phoff=$(kr_elf_uint "$kr_sdk_file" 32 8) || exit 1
+  kr_phsize=$(kr_elf_uint "$kr_sdk_file" 54 2) || exit 1
+  kr_phnum=$(kr_elf_uint "$kr_sdk_file" 56 2) || exit 1
+  [ "$kr_phsize" = 56 ] && [ "$kr_phnum" -gt 0 ] && [ "$kr_phnum" -le 64 ] || exit 1
+  [ "$kr_phoff" -ge 64 ] && [ "$kr_phoff" -le 4096 ] || exit 1
+  kr_i=0; kr_interps=0
+  while [ "$kr_i" -lt "$kr_phnum" ]; do
+    kr_p=$((kr_phoff + kr_i * kr_phsize))
+    kr_type=$(kr_elf_uint "$kr_sdk_file" "$kr_p" 4) || exit 1
+    if [ "$kr_type" = 3 ]; then
+      [ "$(kr_elf_uint "$kr_sdk_file" "$((kr_p + 8))" 8)" = 792 ] || exit 1
+      [ "$(kr_elf_uint "$kr_sdk_file" "$((kr_p + 32))" 8)" = 28 ] || exit 1
+      kr_interps=$((kr_interps + 1))
+    fi
+    kr_i=$((kr_i + 1))
+  done
+  [ "$kr_interps" = 1 ] || exit 1
+  [ "$(od -An -v -tx1 -j 792 -N 28 "$kr_sdk_file" | tr -d ' \n')" = 2f6c696236342f6c642d6c696e75782d7838362d36342e736f2e3200 ] || exit 1
+)
+
+kr_fetch_deb() (
+  kr_cache=$1; kr_name=$2; kr_url=$3; kr_sha=$4
+  kr_path=$kr_cache/$kr_name
+  kr_plain_path "$kr_path" || exit 1
+  if [ -e "$kr_path" ]; then
+    [ -f "$kr_path" ] && [ "$(hash_file "$kr_path")" = "$kr_sha" ] || { kr_error "cached package hash mismatch: $kr_name"; exit 1; }
+  else
+    need curl || exit 1
+    kr_download=$(mktemp "$kr_cache/.download.XXXXXX") || exit 1
+    trap 'rm -f "$kr_download"' EXIT
+    trap 'exit 1' HUP INT TERM
+    curl --proto '=https' --tlsv1.2 -fL --connect-timeout 15 --max-time 180 "$kr_url" -o "$kr_download" || exit 1
+    [ "$(hash_file "$kr_download")" = "$kr_sha" ] || { kr_error "download package hash mismatch: $kr_name"; exit 1; }
+    chmod 644 "$kr_download" && mv "$kr_download" "$kr_path" || exit 1
+  fi
+  printf '%s\n' "$kr_path"
+)
+
+# Only data is extracted; neither dpkg nor any package maintainer script is run.
+kr_extract_deb() (
+  kr_deb=$1; kr_extract=$2; kr_work=$3
+  ar t "$kr_deb" >"$kr_work/members" || exit 1
+  [ "$(grep -Fxc data.tar.xz "$kr_work/members")" = 1 ] || exit 1
+  ar p "$kr_deb" data.tar.xz >"$kr_work/data.tar.xz" || exit 1
+  xz -dc "$kr_work/data.tar.xz" >"$kr_work/data.tar" || exit 1
+  tar -tf "$kr_work/data.tar" >"$kr_work/paths" || exit 1
+  awk '
+    /^\// {bad=1}
+    {n=split($0,p,"/");for(i=1;i<=n;i++)if(p[i]=="..")bad=1}
+    END{exit bad}' "$kr_work/paths" || exit 1
+  mkdir -p "$kr_extract" || exit 1
+  tar -xf "$kr_work/data.tar" -C "$kr_extract" --no-same-owner || exit 1
+  rm -f "$kr_work/data.tar.xz" "$kr_work/data.tar"
+)
+
+kr_copy_private_lib() (
+  kr_extract=$1; kr_dest=$2; kr_name=$3
+  kr_src=$kr_extract/lib/x86_64-linux-gnu/$kr_name
+  [ -e "$kr_src" ] || kr_src=$kr_extract/usr/lib/x86_64-linux-gnu/$kr_name
+  [ -f "$kr_src" ] || exit 1
+  kr_resolved=$(readlink -f "$kr_src") || exit 1
+  case "$kr_resolved" in "$kr_extract"/*) :;; *) exit 1;; esac
+  cp -L "$kr_src" "$kr_dest/$kr_name" && chmod 755 "$kr_dest/$kr_name"
+)
+
+kr_private_closure() (
+  kr_rt=$1
+  kr_plain_path "$kr_rt" || exit 1
+  kr_listing=$(env LD_LIBRARY_PATH="$kr_rt/lib" "$kr_rt/ld.so" --library-path "$kr_rt/lib" --list "$kr_rt/xray" 2>&1) || { printf '%s\n' "$kr_listing" >&2; exit 1; }
+  printf '%s\n' "$kr_listing" | awk -v root="$kr_rt" '
+    /^[[:space:]]*linux-vdso\.so\.[0-9]+[[:space:]]+\(0x[0-9a-f]+\)$/ {vdso++;next}
+    $2=="=>" && $3==root "/lib/" $1 && NF==4 && $4~/^\(0x[0-9a-f]+\)$/ {seen[$1]++;next}
+    # --list labels the interpreter by its final path even during staging.
+    $1=="/opt/xray-runtime/ld.so" && NF==2 && $2~/^\(0x[0-9a-f]+\)$/ {loader++;next}
+    $1=="/opt/xray-runtime/ld.so" && $2=="=>" && $3==root "/ld.so" && NF==4 {loader++;next}
+    {bad=1}
+    END {
+      n=split("libdl.so.2 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6",need," ")
+      for(i=1;i<=n;i++)if(seen[need[i]]!=1)bad=1
+      exit bad || vdso!=1 || loader!=1
+    }' || { kr_error 'dependency closure did not resolve entirely inside the private runtime'; exit 1; }
+)
+
+# The pkg SDK reads /proc/self/exe. Explicit loader execution is valid for --list,
+# but cannot test the SDK version. Publish the private runtime, validate directly,
+# then switch the source service. Nothing invokes the loader as the live worker.
+kr_runtime_live_valid() (
+  [ "$#" = 1 ] && [ "$1" = "$KR_HOME" ] || exit 1
+  kr_rt=$1
+  kr_runtime_fingerprint "$kr_rt" >/dev/null || exit 1
+  [ "$(hash_file "$kr_rt/xray")" = "$KR_PATCHED_SHA" ] || exit 1
+  kr_private_closure "$kr_rt" || exit 1
+  kr_version=$(timeout -k 2 20 env LD_LIBRARY_PATH="$kr_rt/lib" "$kr_rt/xray" --version 2>&1) || {
+    kr_error 'direct SDK version execution failed'; exit 1;
+  }
+  printf '%s\n' "$kr_version" | grep -Eq '(^|[^0-9.])1\.665\.73([^0-9.]|$)' || {
+    kr_error 'direct SDK version mismatch'; exit 1;
+  }
+)
+
+kr_stage_runtime() (
+  [ "$#" = 3 ] || exit 1
+  kr_rt=$1; kr_original=$2; kr_cache=$3
+  # All rejection gates precede mkdir, download, stop, or any live change.
+  kr_platform_supported || exit 1
+  kr_plain_path "$kr_rt" && kr_plain_path "$kr_original" && kr_plain_path "$kr_cache" || exit 1
+  [ -f "$kr_original" ] && [ -r "$kr_original" ] || exit 1
+  kr_sdk_elf_valid "$kr_original" || exit 1
+  [ ! -e "$kr_rt" ] || { [ -d "$kr_rt" ] && [ -z "$(ls -A "$kr_rt")" ]; } || exit 1
+  for kr_tool in ar tar xz od dd sha256sum timeout; do need "$kr_tool" || exit 1; done
+  mkdir -p "$kr_cache" "$kr_rt/lib" || exit 1
+  chmod 755 "$kr_rt" "$kr_rt/lib" || exit 1
+  kr_work=$(mktemp -d "${kr_rt%/*}/.runtime-stage.XXXXXX") || exit 1
+  trap 'rm -rf "$kr_work"' EXIT
+  trap 'exit 1' HUP INT TERM
+  kr_deb=$(kr_fetch_deb "$kr_cache" libc6_2.36-9+deb12u14_amd64.deb https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf) || exit 1
+  kr_extract_deb "$kr_deb" "$kr_work/root" "$kr_work" || exit 1
+  kr_deb=$(kr_fetch_deb "$kr_cache" libgcc-s1_12.2.0-14+deb12u1_amd64.deb https://deb.debian.org/debian/pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb 3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7) || exit 1
+  kr_extract_deb "$kr_deb" "$kr_work/root" "$kr_work" || exit 1
+  kr_deb=$(kr_fetch_deb "$kr_cache" libstdc++6_12.2.0-14+deb12u1_amd64.deb https://deb.debian.org/debian/pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_amd64.deb 5cd3171216d4ab0fc911cfe9c35509bf2dd8f47761c43b7f6a4296701551a24d) || exit 1
+  kr_extract_deb "$kr_deb" "$kr_work/root" "$kr_work" || exit 1
+  for kr_lib in libdl.so.2 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2; do
+    kr_copy_private_lib "$kr_work/root" "$kr_rt/lib" "$kr_lib" || exit 1
+  done
+  for kr_lib in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do
+    if [ -e "$kr_work/root/lib/x86_64-linux-gnu/$kr_lib" ]; then
+      kr_copy_private_lib "$kr_work/root" "$kr_rt/lib" "$kr_lib" || exit 1
+    fi
+  done
+  cp "$kr_rt/lib/ld-linux-x86-64.so.2" "$kr_rt/ld.so" && cp "$kr_original" "$kr_rt/xray" || exit 1
+  # 23 path bytes and five NULs fill the original, verified 28-byte PT_INTERP.
+  printf '/opt/xray-runtime/ld.so\000\000\000\000\000' >"$kr_work/interp" || exit 1
+  [ "$(wc -c <"$kr_work/interp" | tr -d ' ')" = 28 ] || exit 1
+  dd if="$kr_work/interp" of="$kr_rt/xray" bs=1 seek=792 conv=notrunc 2>/dev/null || exit 1
+  chmod 755 "$kr_rt/xray" "$kr_rt/ld.so" || exit 1
+  [ "$(hash_file "$kr_original")" = "$KR_SDK_SHA" ] && [ "$(hash_file "$kr_rt/xray")" = "$KR_PATCHED_SHA" ] || exit 1
+  kr_private_closure "$kr_rt" || exit 1
+  kr_runtime_fingerprint "$kr_rt" >/dev/null || exit 1
+)
+
+kr_runtime_fingerprint() (
+  [ "$#" = 1 ] && kr_plain_path "$1" || exit 1
+  kr_rt=$1
+  [ -d "$kr_rt/lib" ] && [ ! -L "$kr_rt/lib" ] || exit 1
+  LC_ALL=C; export LC_ALL
+  # Names and contents are both covered; ordinary files only, no hidden entries.
+  for kr_entry in "$kr_rt"/* "$kr_rt"/.[!.]* "$kr_rt"/..?*; do
+    [ -e "$kr_entry" ] || [ -L "$kr_entry" ] || continue
+    case "${kr_entry##*/}" in xray|ld.so|lib) :;; *) exit 1;; esac
+  done
+  kr_manifest=
+  for kr_file in "$kr_rt/ld.so" "$kr_rt/xray" "$kr_rt/lib/"* "$kr_rt/lib/".[!.]* "$kr_rt/lib/"..?*; do
+    [ -e "$kr_file" ] || [ -L "$kr_file" ] || continue
+    [ -f "$kr_file" ] && [ ! -L "$kr_file" ] || exit 1
+    kr_rel=${kr_file#"$kr_rt"/}
+    case "$kr_rel" in
+      ld.so|xray|lib/ld-linux-x86-64.so.2|lib/libdl.so.2|lib/libstdc++.so.6|lib/libm.so.6|lib/libgcc_s.so.1|lib/libpthread.so.0|lib/libc.so.6|lib/libnss_dns.so.2|lib/libnss_files.so.2|lib/libresolv.so.2) :;;
+      *) exit 1;;
+    esac
+    kr_digest=$(hash_file "$kr_file") || exit 1
+    kr_manifest=$kr_manifest$kr_digest'  '$kr_rel'
+'
+  done
+  [ -f "$kr_rt/xray" ] && [ -f "$kr_rt/ld.so" ] && [ -n "$kr_manifest" ] || exit 1
+  printf '%s' "$kr_manifest" | sha256sum | awk '{print $1}'
+)
+
+# Unified transaction engine. Staging never invokes a legacy installer.
+# All receipts are private root-owned records; identity values are hashes only.
+kr_error(){ printf 'FAIL: %s\n' "$*" >&2; return 1; }
+kr_hash_valid(){ case "$1" in ''|*[!0-9a-f]*) return 1;; esac; [ "${#1}" = 64 ]; }
+kr_plain(){ suite_regular "$1" || return 1; ! exists "$1" || [ "$(stat -c %h "$1")" = 1 ]; }
+kr_fingerprint(){
+  kr_plain "$1" || return 1
+  if exists "$1"; then
+    KF_HASH=$(hash_file "$1") && KF_MODE=$(stat -c %a "$1") || return 1
+    printf '%s %s\n' "$KF_HASH" "$KF_MODE"
+  else printf '%s\n' '- -'; fi
+}
+kr_snapshot_row(){
+  KSR_VALUE=$(kr_fingerprint "$1") || return 1
+  printf '%s %s\n' "$1" "$KSR_VALUE"
+}
+kr_normalize_nft(){ sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/g'; }
+kr_phase(){
+  printf '%s\n' "$1" > "$KE_B/phase.next" && mv "$KE_B/phase.next" "$KE_B/phase" || return 1
+  printf 'PHASE %s\n' "$1" >> "$KE_B/ledger" || return 1
+}
+kr_record_path(){
+  valid_path "$1" && kr_plain "$1" || return 1
+  awk -v p="$1" '$1==p{found=1} END{exit !found}' "$KE_B/sealed/snapshot.manifest" 2>/dev/null && return 0
+  kr_snapshot_row "$1" >> "$KE_B/sealed/snapshot.manifest" || return 1
+  if exists "$1"; then
+    mkdir -p "$KE_B/sealed/files${1%/*}" && cp -p "$1" "$KE_B/sealed/files$1" || return 1
+    [ "$(kr_fingerprint "$1")" = "$(kr_fingerprint "$KE_B/sealed/files$1")" ] || return 1
+  fi
+}
+kr_plan(){
+  kr_record_path "$1" || return 1
+  if [ "$2" = - ]; then printf '%s - - -\n' "$1" >> "$KE_B/sealed/plan.manifest"
+  else
+    KPL_HASH=$(hash_file "$2") && kr_hash_valid "$KPL_HASH" || return 1
+    printf '%s %s %s %s\n' "$1" "$KPL_HASH" "$3" "${2#"$KE_B/sealed/"}" >> "$KE_B/sealed/plan.manifest"
+  fi
+}
+kr_expected(){ awk -v p="$1" '$1==p{print $2 " " $3; n++} END{if(n!=1)exit 1}' "$2"; }
+kr_allowed(){
+  KA_NOW=$(kr_fingerprint "$1") || return 1
+  KA_OLD=$(kr_expected "$1" "$KE_B/sealed/snapshot.manifest") || return 1
+  [ "$KA_NOW" = "$KA_OLD" ] && return 0
+  KA_PLAN=$(kr_expected "$1" "$KE_B/sealed/plan.manifest" 2>/dev/null) || KA_PLAN=
+  [ "$KA_NOW" = "$KA_PLAN" ] && return 0
+  if [ "$1" = /etc/crontabs/root ]; then
+    [ "$KA_NOW" = "$(hash_file "$KE_B/sealed/cron.paused") 600" ] && return 0
+    [ "$KA_NOW" = "$(hash_file "$KE_B/sealed/cron.final") 600" ] && return 0
+  fi
+  case "$1" in /usr/local/sbin/earnapp-watchdog|/usr/local/sbin/earnapp-recover|/usr/local/sbin/earnapp-limit|/etc/local.d/earnapp-limit.start|/usr/local/sbin/selnu|/usr/local/sbin/tavik|/usr/local/sbin/loren|/etc/local.d/pavri.start)
+    [ "$KA_NOW" = "$(hash_file "$KE_B/sealed/pause") 755" ] && return 0;;
+  esac
+  case "$1" in "$KR_REGISTRY"|"$KR_REGISTRY.pending")
+    [ "$KA_NOW" = "$(hash_file "$KE_B/registry.record") 600" ] && return 0;;
+  esac
+  kr_error 'concurrent or unknown file change retained for review'
+}
+kr_mutate(){
+  # Journal intent before rename/unlink. Recovery accepts only sealed known bytes.
+  KM_PATH=$1; KM_SOURCE=$2; KM_MODE=$3
+  kr_allowed "$KM_PATH" || return 1
+  KM_BEFORE=$(kr_fingerprint "$KM_PATH") || return 1
+  KM_AFTER='- -'
+  if [ "$KM_SOURCE" != - ]; then
+    KM_NEW_HASH=$(hash_file "$KM_SOURCE") && kr_hash_valid "$KM_NEW_HASH" || return 1
+    KM_AFTER="$KM_NEW_HASH $KM_MODE"
+  fi
+  printf 'INTENT %s %s %s\n' "$KM_PATH" "$KM_BEFORE" "$KM_AFTER" >> "$KE_B/ledger" || return 1
+  if [ "$KM_SOURCE" = - ]; then
+    [ "$(kr_fingerprint "$KM_PATH")" = "$KM_BEFORE" ] && rm -f "$KM_PATH" || return 1
+  else
+    kr_mkdir "${KM_PATH%/*}" || return 1
+    KM_TMP=$(mktemp "${KM_PATH%/*}/.xray-runtime-XXXXXXXX") || return 1
+    if ! cp "$KM_SOURCE" "$KM_TMP" || ! chmod "$KM_MODE" "$KM_TMP" ||
+       [ "$(kr_fingerprint "$KM_PATH")" != "$KM_BEFORE" ] || ! mv -f "$KM_TMP" "$KM_PATH"; then
+      rm -f "$KM_TMP"; return 1
+    fi
+  fi
+  [ "$(kr_fingerprint "$KM_PATH")" = "$KM_AFTER" ] || return 1
+  printf 'DONE %s %s\n' "$KM_PATH" "$KM_AFTER" >> "$KE_B/ledger"
+}
+kr_mkdir(){
+  [ "$1" = / ] && return 0
+  valid_path "$1" || return 1
+  [ ! -L "$1" ] || return 1
+  if exists "$1"; then [ -d "$1" ] && [ "$(stat -c %u "$1")" = 0 ]; return $?; fi
+  KMD_PARENT=${1%/*}; [ -n "$KMD_PARENT" ] || KMD_PARENT=/
+  kr_mkdir "$KMD_PARENT" || return 1
+  printf 'MKDIR %s\n' "$1" >> "$KE_B/ledger" || return 1
+  mkdir "$1" && chmod 755 "$1"
+}
+kr_cron_filter(){
+  awk -v mode="$1" '
+  function owned(s){return s=="*/2 * * * * /usr/local/sbin/earnapp-watchdog >/dev/null 2>&1 # EARNAPP-WATCHDOG" ||
+   s=="0 */12 * * * /usr/local/sbin/earnapp-recover scheduled >/dev/null 2>&1 # EARNAPP-12H-STOPSTART" ||
+   s=="*/2 * * * * /usr/local/sbin/selnu >/dev/null 2>&1 # EARNAPP-MAINT-WATCHDOG" ||
+   s=="0 */12 * * * /usr/local/sbin/tavik scheduled >/dev/null 2>&1 # EARNAPP-MAINT-RECOVERY" ||
+   s=="*/2 * * * * /usr/local/sbin/selnu >/dev/null 2>&1 # XRAY-RUNTIME-WATCHDOG"}
+  owned($0){if(mode=="check")print;next}
+  /^[[:space:]]*#/ || /^[[:space:]]*$/{print;next}
+  {s=tolower($0);if(s ~ /earnapp|xray-runtime|xray-maintenance|\/usr\/local\/sbin\/(selnu|tavik|loren)|\/usr\/local\/lib\/(mivora|vesari)/)bad=1;print}
+  END{exit bad}' "$2"
+}
+kr_identity_manifest(){
+  (
+    for KI_PATH in /etc/machine-id /var/lib/dbus/machine-id /etc/earnapp/uuid; do
+      if exists "$KI_PATH"; then
+        [ -f "$KI_PATH" ] && [ -r "$KI_PATH" ] || exit 1
+        KI_LINK=-; [ ! -L "$KI_PATH" ] || KI_LINK=$(readlink "$KI_PATH") || exit 1
+        KI_HASH=$(hash_file "$KI_PATH") && KI_META=$(stat -c '%a:%u:%g' "$KI_PATH") || exit 1
+        printf '%s %s %s %s\n' "$KI_PATH" "$KI_HASH" "$KI_META" "$KI_LINK"
+      else printf '%s absent\n' "$KI_PATH"; fi
+    done
+    if [ -s /etc/earnapp/registered ]; then
+      kr_plain /etc/earnapp/registered && KI_HASH=$(hash_file /etc/earnapp/registered) || exit 1
+      printf '/etc/earnapp/registered %s\n' "$KI_HASH"
+    fi
+    KI_ID=$(kr_source_id) || exit 1
+    KI_HASH=$(printf '%s' "$KI_ID" | sha256sum) || exit 1
+    KI_HASH=${KI_HASH%% *}; kr_hash_valid "$KI_HASH" || exit 1
+    printf 'DEVICE_SHA256 %s\n' "$KI_HASH"
+    KI_HASH=$(hash_file "$KE_ORIGINAL") && kr_hash_valid "$KI_HASH" || exit 1
+    printf 'ORIGINAL_SDK %s %s\n' "$KE_ORIGINAL" "$KI_HASH"
+  ) > "$1"
+}
+kr_source_id(){
+  KI_PROGRAM=$KE_SOURCE_PROGRAM
+  if ! exists "$KI_PROGRAM" && [ -f "${KE_B:-}/sealed/identity.manifest" ]; then
+    KI_ORIGINAL_HASH=$(awk -v p="$KE_ORIGINAL" '$1=="ORIGINAL_SDK"&&$2==p{print $3}' "$KE_B/sealed/identity.manifest") || return 1
+    [ "$(hash_file "$KE_ORIGINAL")" = "$KI_ORIGINAL_HASH" ] || return 1
+    KI_PROGRAM=$KE_ORIGINAL
+  fi
+  if [ "$KI_PROGRAM" = "$KR_PROGRAM" ]; then KI_RAW=$(kr_sdk "$KR_PROGRAM" showid 2>/dev/null) || return 1
+  else KI_RAW=$(timeout -k 2 15 "$KI_PROGRAM" showid 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || return 1; fi
+  printf '%s\n' "$KI_RAW" | awk 'NR==1&&/^sdk-node-[0-9a-f]+$/&&length($0)==41{ok=1} END{exit !(ok&&NR==1)}' || return 1
+  printf '%s\n' "$KI_RAW"
+}
+kr_identity_check(){
+  kr_identity_manifest "$KE_D/identity.now" || return 1
+  # Registration may legitimately be completed after a fresh pending install.
+  if ! grep -q '^/etc/earnapp/registered ' "$KE_B/sealed/identity.manifest"; then
+    sed '/^\/etc\/earnapp\/registered /d' "$KE_D/identity.now" > "$KE_D/identity.compare"
+  else cp "$KE_D/identity.now" "$KE_D/identity.compare" || return 1; fi
+  cmp -s "$KE_D/identity.compare" "$KE_B/sealed/identity.manifest" || kr_error 'original SDK or identity changed; retained for review'
+}
+kr_foreign_manifest(){
+  (
+    for KF_PATH in /usr/local/bin/xray /usr/bin/xray; do
+      ! exists "$KF_PATH" || kr_snapshot_row "$KF_PATH" || exit 1
+    done
+    for KF_DIR in /etc/xray /usr/local/etc/xray /opt/xray; do
+      if exists "$KF_DIR"; then
+        [ -d "$KF_DIR" ] && [ ! -L "$KF_DIR" ] || exit 1
+        find "$KF_DIR" -type l > "$KE_D/foreign.links" || exit 1
+        [ ! -s "$KE_D/foreign.links" ] || exit 1
+        find "$KF_DIR" -type f > "$KE_D/foreign.files.raw" && LC_ALL=C sort "$KE_D/foreign.files.raw" > "$KE_D/foreign.files" || exit 1
+        while IFS= read -r KF_PATH; do kr_snapshot_row "$KF_PATH" || exit 1; done < "$KE_D/foreign.files"
+      fi
+    done
+    for KF_INIT in /etc/init.d/*; do
+      exists "$KF_INIT" || continue
+      KF_SVC=${KF_INIT##*/}; [ "$KF_SVC" != "$KR_SERVICE" ] || continue
+      case "$KF_SVC" in xray*) :;; *) grep -Eq '/(usr/local/bin|usr/bin)/xray([[:space:]"\047]|$)' "$KF_INIT" || continue;; esac
+      kr_snapshot_row "$KF_INIT" || exit 1
+      kr_snapshot_row "/etc/conf.d/$KF_SVC" || exit 1
+      KF_STATE=$(service_state "$KF_SVC") || exit 1
+      printf 'SERVICE %s %s\n' "$KF_SVC" "$KF_STATE"
+      runlevels_for "$KF_SVC" > "$KE_D/foreign.levels" || exit 1
+      while IFS= read -r KF_LEVEL; do printf 'LEVEL %s %s\n' "$KF_SVC" "$KF_LEVEL"; done < "$KE_D/foreign.levels"
+      # Hash literal config files referenced outside the conventional directories.
+      for KF_TEXT in "$KF_INIT" "/etc/conf.d/$KF_SVC"; do
+        [ ! -f "$KF_TEXT" ] || awk '{gsub(/["\047=;,()]/," ");for(i=1;i<=NF;i++)if($i ~ /^\//)print $i}' "$KF_TEXT" > "$KE_D/foreign.references" || exit 1
+        [ -f "$KF_TEXT" ] || continue
+        while IFS= read -r KF_PATH; do
+          valid_path "$KF_PATH" || exit 1
+          [ ! -f "$KF_PATH" ] || kr_snapshot_row "$KF_PATH" || exit 1
+        done < "$KE_D/foreign.references"
+      done
+      for KF_PROC in /proc/[0-9]*; do
+        KF_EXE=$(readlink "$KF_PROC/exe" 2>/dev/null) || continue
+        case "$KF_EXE" in /usr/local/bin/xray|/usr/bin/xray)
+          KF_STAMP=$(process_stamp "${KF_PROC##*/}") && KF_HASH=$(hash_file "$KF_PROC/exe") || exit 1
+          printf 'PROCESS %s %s %s\n' "${KF_PROC##*/}" "$KF_STAMP" "$KF_HASH";; esac
+      done
+    done
+  ) > "$1.raw" || return 1
+  LC_ALL=C sort -u "$1.raw" > "$1" && rm "$1.raw"
+}
+kr_foreign_check(){ kr_foreign_manifest "$KE_D/foreign.now" && cmp -s "$KE_D/foreign.now" "$KE_B/sealed/foreign.manifest" || kr_error 'foreign Xray files, activation or processes changed'; }
+kr_source_state(){
+  if [ "$KE_SOURCE_PROGRAM" = "$KR_PROGRAM" ]; then KS_TEXT=$(kr_sdk "$KR_PROGRAM" status 2>/dev/null) || return 1
+  else KS_TEXT=$(timeout -k 2 15 "$KE_SOURCE_PROGRAM" status 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || return 1; fi
+  printf '%s\n' "$KS_TEXT" | sed "s/$(printf '\033')\[[0-9;]*[[:alpha:]]//g;s/$(printf '\r')//g" | awk '
+  {sub(/^[[:space:]]+/,"");sub(/[[:space:]]+$/,"")}
+  /^[^[:alnum:]]*Current status: enabled$/{n++;s="enabled"}
+  /^[^[:alnum:]]*Current status: disabled$/{n++;s="disabled"}
+  END{if(n==1)print s;else exit 1}'
+}
+kr_source_worker() (
+  SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE
+  NSP_INIT=/etc/init.d/$OLD_SVC; NSP_INIT_HASH=$(hash_file "$NSP_INIT") || exit 1
+  NSP_CONF_HASH=absent; [ ! -f "/etc/conf.d/$OLD_SVC" ] || NSP_CONF_HASH=$(hash_file "/etc/conf.d/$OLD_SVC") || exit 1
+  NSP_CANON=$(readlink -f "$SDK_BIN") && NSP_HASH=$(hash_file "$SDK_BIN") || exit 1
+  suite_source_live_key
+)
+kr_source_absent() (
+  SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE
+  if ! exists "$SDK_BIN"; then
+    [ "$(kr_expected "$SDK_BIN" "$KE_B/sealed/plan.manifest")" = '- -' ] || exit 1
+    kr_program_absent "$OLD_SVC" "$SDK_BIN"; exit "$?"
+  fi
+  NSP_CANON=$(readlink -f "$SDK_BIN") && NSP_HASH=$(hash_file "$SDK_BIN") || exit 1
+  KSA_SCAN=$(suite_source_scan) || exit 1
+  [ -z "$KSA_SCAN" ] && suite_source_meta_guard
+)
+kr_saved_source_absent() (
+  KE_SOURCE_SERVICE=$(sed -n 's/^SOURCE_SERVICE=//p' "$KE_B/sealed/settings")
+  KE_SOURCE_PROGRAM=$(sed -n 's/^SOURCE_PROGRAM=//p' "$KE_B/sealed/settings")
+  kr_source_absent
+)
+kr_candidate_worker() (
+  exec 6>&- 7>&- 8>&- 9>&-
+  KC_COMMON=$KE_B/sealed/helpers/common
+  [ "$(hash_file /usr/local/lib/mivora.sh)" = "$(hash_file "$KC_COMMON")" ] || exit 1
+  . "$KC_COMMON" || exit 1
+  if [ "${1:-}" = stop ]; then
+    KC_RC=$(service_state "$KR_SERVICE") || exit 1
+    case "$KC_RC" in 0|32) :;; *) exit 1;; esac
+    runtime_service_state(){ printf '0\n'; }
+  fi
+  KC_KEY=$(worker_snapshot) && [ -n "$KC_KEY" ] || exit 1
+  KC_PID=${KC_KEY%%:*}; KC_STAMP=$(process_stamp "$KC_PID") || exit 1
+  [ "$(cat "/proc/$KC_PID/comm")" = xray ] && [ "$(readlink "/proc/$KC_PID/exe")" = "$KR_PROGRAM" ] || exit 1
+  [ "$(hash_file "/proc/$KC_PID/exe")" = "$(hash_file "$KR_PROGRAM")" ] || exit 1
+  [ "$(tr '\000' '\n' < "/proc/$KC_PID/cmdline")" = "$(printf '%s\nrun' "$KR_PROGRAM")" ] || exit 1
+  KC_GROUP=$(awk -F: '$1==0{print $3}' "/proc/$KC_PID/cgroup") || exit 1
+  [ "${KC_GROUP##*/}" = "openrc.$KR_SERVICE" ] && [ "$(process_stamp "$KC_PID")" = "$KC_STAMP" ] || exit 1
+  printf '%s\n' "$KC_KEY"
+)
+kr_program_absent() (
+  exec 6>&- 7>&- 8>&- 9>&-
+  KCA_SERVICE=$1; KCA_PROGRAM=$2
+  # This proof deliberately survives removal of the program during restoration.
+  KCA_CHILD=$(suite_updater_meta_value "$KCA_SERVICE" child_pid) || exit 1
+  case "$KCA_CHILD" in ''|0) :;; *[!0-9]*) exit 1;; *) [ ! -d "/proc/$KCA_CHILD" ] || exit 1;; esac
+  KCA_PIDFILE=$(suite_updater_meta_value "$KCA_SERVICE" pidfile) || exit 1
+  if [ -n "$KCA_PIDFILE" ]; then
+    valid_path "$KCA_PIDFILE" || exit 1
+    if exists "$KCA_PIDFILE"; then
+      kr_plain "$KCA_PIDFILE" || exit 1
+      KCA_PARENT=$(cat "$KCA_PIDFILE") || exit 1
+      case "$KCA_PARENT" in ''|*[!0-9]*) exit 1;; esac
+      [ ! -d "/proc/$KCA_PARENT" ] || exit 1
+    fi
+  fi
+  for KCA_PROC in /proc/[0-9]*; do
+    [ -d "$KCA_PROC" ] || continue
+    KCA_EXE=$(readlink "$KCA_PROC/exe" 2>/dev/null) || KCA_EXE=
+    case "${KCA_EXE% (deleted)}" in "$KCA_PROGRAM") exit 1;; esac
+    KCA_ARGS=$(tr '\000' '\n' < "$KCA_PROC/cmdline" 2>/dev/null) || { [ ! -d "$KCA_PROC" ] && continue; exit 1; }
+    printf '%s\n' "$KCA_ARGS" | awk -v p="$KCA_PROGRAM" -v s="$KCA_SERVICE" '$0==p{bad=1} NR==2&&$0==s{bad=1} END{exit bad}' || exit 1
+    if [ -r "$KCA_PROC/maps" ]; then
+      awk -v p="$KCA_PROGRAM" '$6==p{bad=1} END{exit bad}' "$KCA_PROC/maps" || exit 1
+    else [ ! -d "$KCA_PROC" ] || exit 1; fi
+  done
+)
+kr_candidate_absent(){ kr_program_absent "$KR_SERVICE" "$KR_PROGRAM"; }
+kr_candidate_connection() (
+  exec 6>&- 7>&- 8>&- 9>&-
+  . "$KE_B/sealed/helpers/common" || exit 1
+  KC_KEY=$(worker_snapshot) && [ -n "$KC_KEY" ] || exit 1
+  stats "${KC_KEY%%:*}" && [ "$(worker_snapshot)" = "$KC_KEY" ] || exit 1
+  printf '%s\n' "$ESTAB"
+)
+kr_table_owned(){
+  case "$1" in earnapp_limit) suite_table_owned "$1" earnapp earnapp-;;
+    earnapp_maintenance) suite_table_owned "$1" "$2" earnapp-maintenance-;;
+    "$KR_TABLE")
+      KT_TEXT=$(nft list table inet "$KR_TABLE") || return 1
+      printf '%s\n' "$KT_TEXT" | awk -v table="$KR_TABLE" -v tag="$KR_TAG" '
+      function number(s){return s ~ /^[0-9]+$/ && length(s)<=20}
+      {s=$0;sub(/^[[:space:]]+/,"",s);sub(/[[:space:]]+$/,"",s);if(s=="")next;n=split(s,a," ")}
+      step==0 && s=="table inet "table" {"{step=1;next}
+      step==1 && s=="chain output {"{step=2;next}
+      step==2 && (s=="type filter hook output priority -10; policy accept;" || s=="type filter hook output priority filter - 10; policy accept;"){step=3;next}
+      step==3 && n==26 && a[1]=="socket"&&a[2]=="cgroupv2"&&a[3]=="level"&&number(a[4])&&a[4]+0>0&&a[4]+0<=255&&number(a[5])&&a[5]+0>0&&a[6]=="meta"&&a[7]=="l4proto"&&a[8]=="{"&&a[9]=="tcp,"&&a[10]=="udp"&&a[11]=="}"&&a[12]=="ct"&&a[13]=="state"&&a[14]=="new"&&a[15]=="ct"&&a[16]=="count"&&a[17]=="over"&&a[18]=="20"&&a[19]=="counter"&&a[20]=="packets"&&number(a[21])&&a[22]=="bytes"&&number(a[23])&&a[24]=="reject"&&a[25]=="comment"&&a[26]==("\""tag":"a[5]":"a[4]":20\""){step=4;next}
+      step==4&&s=="}"{step=5;next} step==5&&s=="}"{step=6;next}{bad=1}
+      END{exit bad||step!=6}' ;;
+    *) return 1;; esac
+}
+kr_tables_snapshot(){
+  KT_LIST=$(nft list tables) || return 1
+  for KT_TABLE in earnapp_limit earnapp_maintenance "$KR_TABLE"; do
+    if printf '%s\n' "$KT_LIST" | grep -Fxq "table inet $KT_TABLE"; then
+      kr_table_owned "$KT_TABLE" "$KE_SOURCE_SERVICE" || return 1
+      nft list table inet "$KT_TABLE" > "$1/$KT_TABLE.nft" || return 1
+    else : > "$1/$KT_TABLE.absent"; fi
+  done
+}
+kr_tables_unchanged(){
+  KT_LIST=$(nft list tables) || return 1
+  for KT_TABLE in earnapp_limit earnapp_maintenance "$KR_TABLE"; do
+    if [ -f "$KE_B/sealed/$KT_TABLE.nft" ]; then
+      kr_table_owned "$KT_TABLE" "$KE_SOURCE_SERVICE" || return 1
+      nft list table inet "$KT_TABLE" | kr_normalize_nft > "$KE_D/table.now" || return 1
+      kr_normalize_nft < "$KE_B/sealed/$KT_TABLE.nft" > "$KE_D/table.was" || return 1
+      cmp -s "$KE_D/table.now" "$KE_D/table.was" || return 1
+    else ! printf '%s\n' "$KT_LIST" | grep -Fxq "table inet $KT_TABLE" || return 1; fi
+  done
+}
+kr_clear_table(){
+  KT_LIST=$(nft list tables) || return 1
+  if printf '%s\n' "$KT_LIST" | grep -Fxq "table inet $1"; then
+    kr_table_owned "$1" "$2" || return 1
+    printf 'DELETE_TABLE %s\n' "$1" >> "$KE_B/ledger" || return 1
+    nft delete table inet "$1" || return 1
+  fi
+}
+kr_verify_limiter(){
+  kr_table_owned "$KR_TABLE" "$KR_SERVICE" || return 1
+  KL_KEY=$(kr_candidate_worker) || return 1
+  KL_GROUP=$(awk -F: '$1==0{print $3}' "/proc/${KL_KEY%%:*}/cgroup") || return 1
+  KL_INODE=$(stat -Lc %i "/sys/fs/cgroup$KL_GROUP") || return 1
+  [ "$(cat "$KR_STATE/limit-key")" = "$KR_TAG:$(uname -r):$KL_INODE:20:$KL_GROUP" ] || return 1
+  KL_TEXT=$(nft list table inet "$KR_TABLE") || return 1
+  KL_HASH=$(printf '%s\n' "$KL_TEXT" | kr_normalize_nft | sha256sum) || return 1
+  [ "$(cat "$KR_STATE/limit-digest")" = "${KL_HASH%% *}" ]
+}
+kr_static_current(){
+  while read -r KC_PATH KC_HASH KC_MODE KC_SOURCE; do
+    [ "$(kr_fingerprint "$KC_PATH")" = "$KC_HASH $KC_MODE" ] || return 1
+  done < "$KE_B/sealed/plan.manifest"
+  while read -r KC_PATH KC_HASH KC_MODE; do
+    case "$KC_PATH" in /etc/crontabs/root|"$KR_REGISTRY"|"$KR_REGISTRY.pending") continue;; esac
+    if ! awk -v p="$KC_PATH" '$1==p{found=1} END{exit !found}' "$KE_B/sealed/plan.manifest"; then
+      [ "$(kr_fingerprint "$KC_PATH")" = "$KC_HASH $KC_MODE" ] || return 1
+    fi
+  done < "$KE_B/sealed/snapshot.manifest"
+  KC_RUNTIME=$(kr_runtime_fingerprint "$KR_HOME") || return 1
+  [ "$KC_RUNTIME" = "$(cat "$KE_B/sealed/runtime.fingerprint")" ] || return 1
+  for KC_PATH in "/etc/conf.d/$KR_SERVICE" "/etc/conf.d/$KR_SERVICE".*; do ! exists "$KC_PATH" || return 1; done
+  [ "$(kr_fingerprint /etc/crontabs/root)" = "$(hash_file "$KE_B/sealed/cron.final") 600" ] || return 1
+  [ "$(cat "$KR_REGISTRY")" = "$(cat "$KE_B/registry.record")" ] || return 1
+  [ -z "$(runlevels_for earnapp)" ] && [ -z "$(runlevels_for kaleno)" ] || return 1
+  [ "$(runlevels_for "$KR_SERVICE")" = default ] || return 1
+  [ "$(service_state crond)" = 0 ] && exists /etc/runlevels/default/crond && exists /etc/runlevels/default/local || return 1
+  kr_saved_source_absent && kr_identity_check && kr_foreign_check
+}
+kr_load_receipt(){
+  kr_plain "$1" && [ -s "$1" ] || return 1
+  KE_B=$(sed -n 's/^RECEIPT=//p' "$1"); KE_SEAL=$(sed -n 's/^SEAL=//p' "$1")
+  [ "$(wc -l < "$1")" = 2 ] && valid_path "$KE_B" && kr_hash_valid "$KE_SEAL" || return 1
+  case "$KE_B" in "$KR_BACKUP_PREFIX"*) :;; *) return 1;; esac
+  kr_plain "$KE_B/sealed/seal" && [ "$(hash_file "$KE_B/sealed/seal")" = "$KE_SEAL" ] || return 1
+  (cd "$KE_B/sealed" && sha256sum -c seal >/dev/null 2>&1) || return 1
+  kr_plain "$KE_B/phase" && kr_plain "$KE_B/ledger" && kr_plain "$KE_B/registry.record" || return 1
+  [ "$(cat "$KE_B/registry.record")" = "$(cat "$1")" ] || return 1
+  KE_MODE=$(sed -n 's/^MODE=//p' "$KE_B/sealed/settings")
+  KE_SOURCE_SERVICE=$(sed -n 's/^SOURCE_SERVICE=//p' "$KE_B/sealed/settings")
+  KE_SOURCE_PROGRAM=$(sed -n 's/^SOURCE_PROGRAM=//p' "$KE_B/sealed/settings")
+  KE_ORIGINAL=$(sed -n 's/^ORIGINAL=//p' "$KE_B/sealed/settings")
+  case "$KE_MODE" in fresh|original|managed|named) :;; *) return 1;; esac
+  case "$KE_MODE:$KE_SOURCE_SERVICE" in fresh:earnapp|original:earnapp|managed:earnapp|named:kaleno) :;; *) return 1;; esac
+  valid_path "$KE_SOURCE_PROGRAM" && valid_path "$KE_ORIGINAL" || return 1
+  [ "$(sed -n 's/^VERSION=//p' "$KE_B/sealed/settings")" = "$KR_VERSION" ] || return 1
+  case "$(cat "$KE_B/phase")" in prepared|pausing|source-stop-intent|source-stopped|publishing|canonical-start-intent|active|restoring|restored) :;; *) return 1;; esac
+}
+kr_detect(){
+  KE_MODE=fresh; KE_SOURCE_SERVICE=earnapp; KE_SOURCE_PROGRAM=/usr/bin/earnapp; KE_ORIGINAL=/usr/bin/earnapp
+  if exists "$KR_REGISTRY.pending"; then
+    kr_load_receipt "$KR_REGISTRY.pending" || return 1
+    kr_error 'an interrupted transaction needs restore --apply before installation'; return 1
+  fi
+  if exists "$KR_REGISTRY"; then
+    kr_load_receipt "$KR_REGISTRY" || return 1
+    KE_MODE=current; KE_SOURCE_SERVICE=$KR_SERVICE; KE_SOURCE_PROGRAM=$KR_PROGRAM
+    return 0
+  fi
+  # Every canonical destination must be absent before adopting a legacy state.
+  for KD_PATH in "$KR_HOME" "$KR_CONFIG" "$KR_ENTRY" "/etc/init.d/$KR_SERVICE" "/etc/conf.d/$KR_SERVICE" "$KR_STATE"; do
+    ! exists "$KD_PATH" || { kr_error 'unrecorded canonical destination retained'; return 1; }
+  done
+  for KD_PATH in /etc/conf.d/xray-runtime.* /etc/runlevels/*/xray-runtime; do ! exists "$KD_PATH" || return 1; done
+  if exists "$NAMING_REGISTRY"; then
+    U_B=$(cat "$NAMING_REGISTRY") || return 1
+    naming_load && naming_check_originals && naming_check_aliases 1 && suite_check_owned "$U_B" || return 1
+    [ "$(cat "$U_B/naming.state")" = active ] || return 1
+    KE_MODE=named; KE_SOURCE_SERVICE=kaleno; KE_SOURCE_PROGRAM=/usr/local/lib/vesari; KE_ORIGINAL=$N_SOURCE
+  elif exists "$SUITE_REGISTRY"; then
+    suite_read_current || return 1
+    [ "$U_CURRENT_VERSION" = "$SUITE_VERSION" ] || return 1
+    KE_MODE=managed; KE_ORIGINAL=$U_SOURCE; KE_SOURCE_PROGRAM=$U_SOURCE
+  elif exists /usr/bin/earnapp; then
+    KE_MODE=original
+    for KD_TAG in old-common old-watchdog old-recover old-limit old-boot; do
+      KD_PATH=$(suite_path "$KD_TAG") || return 1
+      if exists "$KD_PATH"; then
+        kr_plain "$KD_PATH" && suite_legacy_hash "$KD_TAG" "$(hash_file "$KD_PATH")" || return 1
+      fi
+    done
+    for KD_PATH in /usr/local/lib/mivora.sh /usr/local/sbin/selnu /usr/local/sbin/tavik /usr/local/sbin/loren /etc/local.d/pavri.start /usr/local/lib/vesari /etc/init.d/kaleno /etc/conf.d/kaleno; do
+      ! exists "$KD_PATH" || { kr_error 'unrecorded legacy helper or named service retained'; return 1; }
+    done
+  else
+    for KD_PATH in /usr/local/bin/earnapp /opt/earnapp/earnapp /etc/init.d/earnapp /etc/conf.d/earnapp /etc/earnapp/uuid /etc/earnapp/registered /usr/local/lib/mivora.sh /usr/local/sbin/selnu /usr/local/sbin/tavik /usr/local/sbin/loren /usr/local/lib/vesari /etc/init.d/kaleno /etc/conf.d/kaleno /usr/local/lib/earnapp-original.sh /usr/local/sbin/earnapp-watchdog /usr/local/sbin/earnapp-recover /usr/local/sbin/earnapp-limit /etc/local.d/earnapp-limit.start /etc/local.d/pavri.start /etc/earnapp/maintenance.conf /etc/earnapp/watchdog.conf /etc/runlevels/*/earnapp /etc/runlevels/*/kaleno; do
+      ! exists "$KD_PATH" || { kr_error 'partial or unknown source installation retained'; return 1; }
+    done
+    SDK_BIN=/usr/bin/earnapp; OLD_SVC=earnapp; NSP_CANON=/usr/bin/earnapp
+    suite_source_references || return 1
+    return 0
+  fi
+  kr_plain "$KE_ORIGINAL" && kr_plain "$KE_SOURCE_PROGRAM" && [ -x "$KE_SOURCE_PROGRAM" ] || return 1
+  (SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE; suite_source_init_valid "/etc/init.d/$OLD_SVC" && suite_source_config_valid) || return 1
+  if [ "$KE_MODE" = original ]; then
+    SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE
+    NSP_CANON=$(readlink -f "$SDK_BIN") || return 1
+    suite_source_references || return 1
+  else
+    UPDATER_MAIN_SVC=$KE_SOURCE_SERVICE; suite_updater_guard "$KE_ORIGINAL" || return 1
+  fi
+  KE_SDK_STATE=$(kr_source_state) || return 1
+  [ "$KE_SDK_STATE" != disabled ] || { printf '%s\n' 'INSTALL_STATE=SDK_DISABLED'; return 22; }
+  [ "$KE_SDK_STATE" = enabled ] || return 1
+  KE_SOURCE_KEY=$(kr_source_worker) && [ -n "$KE_SOURCE_KEY" ] || return 1
+}
+kr_dependency_prepare(){
+  KE_DEPENDENCIES=
+  for KD_ITEM in bash:bash curl:curl jq:jq update-ca-certificates:ca-certificates timeout:coreutils ss:iproute2 nft:nftables flock:util-linux ar:binutils xz:xz ldd:musl-utils; do
+    KD_COMMAND=${KD_ITEM%%:*}; KD_PACKAGE=${KD_ITEM#*:}
+    if ! command -v "$KD_COMMAND" >/dev/null 2>&1; then
+      case " $KE_DEPENDENCIES " in *" $KD_PACKAGE "*) :;; *) KE_DEPENDENCIES="$KE_DEPENDENCIES $KD_PACKAGE";; esac
+    fi
+  done
+  if command -v apk >/dev/null 2>&1; then
+    for KD_PACKAGE in gcompat libstdc++ musl-utils; do
+      if ! apk info -e "$KD_PACKAGE" >/dev/null 2>&1; then
+        case " $KE_DEPENDENCIES " in *" $KD_PACKAGE "*) :;; *) KE_DEPENDENCIES="$KE_DEPENDENCIES $KD_PACKAGE";; esac
+      fi
+    done
+  fi
+  [ -n "$KE_DEPENDENCIES" ] || return 0
+  printf 'REQUIRED_PACKAGES=%s\n' "${KE_DEPENDENCIES# }"
+  if [ "$1" != apply ]; then printf '%s\n' 'PRECHECK_STATE=DEPENDENCIES_REQUIRED'; return 23; fi
+  require_root && need apk || return 1
+  printf '%s\n' 'DEPENDENCY_CHANGE=install required Alpine packages; packages are retained on restore.'
+  # This list contains package names produced above, never user input.
+  apk add --no-cache $KE_DEPENDENCIES >/dev/null 2>&1 || { kr_error 'required dependency installation failed'; return 1; }
+}
+kr_backup_parent(){
+  KBP_PARENT=${KR_BACKUP_PREFIX%/*}
+  kr_plain_path "$KBP_PARENT" || return 1
+  if exists "$KBP_PARENT"; then
+    [ -d "$KBP_PARENT" ] && [ "$(stat -c %u "$KBP_PARENT")" = 0 ] || return 1
+    KBP_MODE=$(stat -c %a "$KBP_PARENT") || return 1
+    [ "$((0$KBP_MODE & 022))" = 0 ] || return 1
+  else
+    KBP_GRAND=${KBP_PARENT%/*}; [ -n "$KBP_GRAND" ] || KBP_GRAND=/
+    kr_plain_path "$KBP_GRAND" && [ -d "$KBP_GRAND" ] && [ "$(stat -c %u "$KBP_GRAND")" = 0 ] || return 1
+    mkdir "$KBP_PARENT" && chmod 755 "$KBP_PARENT" || return 1
+    KE_BACKUP_PARENT_CREATED=$KBP_PARENT
+  fi
+}
+kr_vendor_prepare(){
+  kr_backup_parent || return 1
+  KE_VENDOR_B=$(mktemp -d "${KR_BACKUP_PREFIX}vendor-$(date -u +%Y%m%d-%H%M%S)-XXXXXXXX") || return 1
+  mkdir "$KE_VENDOR_B/files" || return 1
+  : > "$KE_VENDOR_B/before.manifest"; : > "$KE_VENDOR_B/ledger"
+  for KV_SVC in earnapp_upgrader earnapp-upgrader; do
+    KV_EXISTING=0
+    for KV_PATH in "/etc/init.d/$KV_SVC" "/etc/conf.d/$KV_SVC" "/etc/systemd/system/$KV_SVC.service" "/usr/lib/systemd/system/$KV_SVC.service" "/lib/systemd/system/$KV_SVC.service"; do
+      kr_snapshot_row "$KV_PATH" >> "$KE_VENDOR_B/before.manifest" || return 1
+      if exists "$KV_PATH"; then
+        KV_EXISTING=1
+        mkdir -p "$KE_VENDOR_B/files${KV_PATH%/*}" && cp -p "$KV_PATH" "$KE_VENDOR_B/files$KV_PATH" || return 1
+      fi
+    done
+    runlevels_for "$KV_SVC" > "$KE_VENDOR_B/$KV_SVC.before.runlevels" || return 1
+    [ ! -s "$KE_VENDOR_B/$KV_SVC.before.runlevels" ] || KV_EXISTING=1
+    printf '%s\n' "$KV_EXISTING" > "$KE_VENDOR_B/$KV_SVC.existing"
+  done
+  # Existing updaters must already be verifiably inactive; adoption is forbidden.
+  if grep -q '^1$' "$KE_VENDOR_B/earnapp_upgrader.existing" "$KE_VENDOR_B/earnapp-upgrader.existing"; then
+    suite_updater_guard /usr/bin/earnapp || return 1
+  fi
+  printf '%s\n' vendor-bootstrap-intent > "$KE_VENDOR_B/phase"
+  printf 'VENDOR_SIDE_EFFECT_RECEIPT=%s\n' "$KE_VENDOR_B"
+}
+kr_vendor_quiesce(){
+  for KV_SVC in earnapp_upgrader earnapp-upgrader; do
+    if [ "$(cat "$KE_VENDOR_B/$KV_SVC.existing")" = 1 ]; then
+      while read -r KV_PATH KV_HASH KV_MODE; do
+        case "$KV_PATH" in */"$KV_SVC"|*/"$KV_SVC.service")
+          [ "$(kr_fingerprint "$KV_PATH")" = "$KV_HASH $KV_MODE" ] || return 1;; esac
+      done < "$KE_VENDOR_B/before.manifest"
+      continue
+    fi
+    ! exists "/etc/init.d/$KV_SVC" && continue
+    kr_plain "/etc/init.d/$KV_SVC" || return 1
+    # Reuse the strict literal OpenRC parser; only the genuine updater argument
+    # differs. Hooks, expansions, non-root users and extra functions are rejected.
+    awk '
+      /^[[:space:]]*command_args=/{
+        s=$0;sub(/^[[:space:]]*command_args=/,"",s);sub(/[[:space:]]+$/,"",s)
+        if(s=="autoupgrade" || s=="\"autoupgrade\"" || s==sprintf("%cautoupgrade%c",39,39)){n++;print "command_args=\"run\"";next}
+      }{print} END{exit n!=1}' "/etc/init.d/$KV_SVC" > "$KE_VENDOR_B/$KV_SVC.validation-init" || return 1
+    chmod 755 "$KE_VENDOR_B/$KV_SVC.validation-init" || return 1
+    (SDK_BIN=/usr/bin/earnapp; OLD_SVC=$KV_SVC; suite_source_init_valid "$KE_VENDOR_B/$KV_SVC.validation-init" && suite_source_config_valid) || {
+      kr_error 'new vendor updater has an unsupported hook; retained without execution'; return 1;
+    }
+    kr_snapshot_row "/etc/init.d/$KV_SVC" > "$KE_VENDOR_B/$KV_SVC.owned" || return 1
+    kr_snapshot_row "/etc/conf.d/$KV_SVC" >> "$KE_VENDOR_B/$KV_SVC.owned" || return 1
+    runlevels_for "$KV_SVC" > "$KE_VENDOR_B/$KV_SVC.after.runlevels" || return 1
+    KV_STATE=$(service_state "$KV_SVC") || return 1
+    printf '%s\n' "$KV_STATE" > "$KE_VENDOR_B/$KV_SVC.status" || return 1
+    cp -p "/etc/init.d/$KV_SVC" "$KE_VENDOR_B/$KV_SVC.original-init" || return 1
+    if exists "/etc/conf.d/$KV_SVC"; then cp -p "/etc/conf.d/$KV_SVC" "$KE_VENDOR_B/$KV_SVC.original-conf" || return 1; fi
+    case "$KV_STATE" in 0)
+      KV_WORKERS=$(service_worker_pids "$KV_SVC" /usr/bin/earnapp 6>&- 7>&- 8>&- 9>&-) || return 1
+      set -- $KV_WORKERS; [ "$#" = 1 ] || return 1
+      KV_PID=$1; KV_STAMP=$(process_stamp "$KV_PID") || return 1
+      KV_PARENT=${KV_STAMP%%:*}; KV_PARENT_STAMP=$(process_stamp "$KV_PARENT") || return 1
+      KV_ARGS=$(tr '\000' '\n' < "/proc/$KV_PID/cmdline") || return 1
+      [ "$KV_ARGS" = "$(printf '/usr/bin/earnapp\nautoupgrade')" ] || return 1
+      KV_PARENT_ARGS=$(tr '\000' '\n' < "/proc/$KV_PARENT/cmdline") || return 1
+      printf '%s\n' "$KV_PARENT_ARGS" | awk -v s="$KV_SVC" 'NR==2{ok=($0==s)} END{exit !ok}' || return 1
+      for KV_PROC in "$KV_PID" "$KV_PARENT"; do awk '/^Uid:/{ok=(NF==5&&$2==0&&$3==0&&$4==0&&$5==0)} END{exit !ok}' "/proc/$KV_PROC/status" || return 1; done
+      printf 'WORKER %s %s %s\n' "$KV_SVC" "$KV_STAMP" "$KV_PARENT_STAMP" >> "$KE_VENDOR_B/ledger" || return 1;;
+      3) :;; *) return 1;; esac
+    # Seal new updater ownership before stopping exactly this validated service.
+    (cd "$KE_VENDOR_B" && sha256sum "$KV_SVC.owned" "$KV_SVC.after.runlevels" "$KV_SVC.validation-init" "$KV_SVC.original-init" "$KV_SVC.status" > "$KV_SVC.seal" &&
+      { [ ! -f "$KV_SVC.original-conf" ] || sha256sum "$KV_SVC.original-conf" >> "$KV_SVC.seal"; }) || return 1
+    while read -r KV_PATH KV_HASH KV_MODE; do [ "$(kr_fingerprint "$KV_PATH")" = "$KV_HASH $KV_MODE" ] || return 1; done < "$KE_VENDOR_B/$KV_SVC.owned"
+    if [ "$KV_STATE" = 0 ]; then
+      [ "$(process_stamp "$KV_PID")" = "$KV_STAMP" ] && [ "$(process_stamp "$KV_PARENT")" = "$KV_PARENT_STAMP" ] || return 1
+      printf 'STOP_NEW_VENDOR_UPDATER %s\n' "$KV_SVC" >> "$KE_VENDOR_B/ledger" || return 1
+      timeout -k 5 30 rc-service "$KV_SVC" stop 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+      [ ! -d "/proc/$KV_PID" ] && [ ! -d "/proc/$KV_PARENT" ] || return 1
+    fi
+    while IFS= read -r KV_LEVEL; do
+      valid_name "$KV_LEVEL" && [ -L "/etc/runlevels/$KV_LEVEL/$KV_SVC" ] &&
+        [ "$(readlink -f "/etc/runlevels/$KV_LEVEL/$KV_SVC")" = "/etc/init.d/$KV_SVC" ] || return 1
+      printf 'DISABLE_NEW_VENDOR_UPDATER %s %s\n' "$KV_SVC" "$KV_LEVEL" >> "$KE_VENDOR_B/ledger" || return 1
+      rc-update del "$KV_SVC" "$KV_LEVEL" 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    done < "$KE_VENDOR_B/$KV_SVC.after.runlevels"
+  done
+  printf '%s\n' vendor-retained-updater-quiesced > "$KE_VENDOR_B/phase"
+  printf 'VENDOR_SIDE_EFFECT_RECEIPT=%s\n' "$KE_VENDOR_B"
+  suite_updater_guard /usr/bin/earnapp
+}
+kr_preconditions(){
+  [ "$(uname -m)" = x86_64 ] && [ -f /etc/alpine-release ] || { kr_error 'supported target is Alpine x86_64 with OpenRC'; return 1; }
+  for KP_TOOL in awk sha256sum stat cmp cp chmod mv ln mktemp timeout flock nft rc-service rc-update find sort sed readlink install; do need "$KP_TOOL" || return 1; done
+  for KP_PATH in "$KR_HOME" "$KR_CONFIG" "$KR_ENTRY" "$KR_STATE" "$KR_REGISTRY" "$KR_REGISTRY.pending" "$KR_SETUP_LOCK" "$KR_WORKER_LOCK" "${KR_BACKUP_PREFIX%/*}" "/etc/init.d/$KR_SERVICE" /etc/local.d/pavri.start /usr/local/lib/mivora.sh /usr/local/sbin/selnu /usr/local/sbin/tavik /usr/local/sbin/loren; do
+    kr_plain_path "$KP_PATH" || { kr_error 'a canonical path or ancestor is a symlink'; return 1; }
+  done
+  for KP_LOCK in "$KR_WORKER_LOCK" /run/earnapp-maintenance.lockfile /run/earnapp-setup.lockfile /run/earnapp-watchdog.lockfile /run/earnapp-maintenance.worker.lockfile; do
+    kr_lock_guard "$KP_LOCK" || return 1
+  done
+  kr_plain /etc/crontabs/root || return 1
+  for KP_SHARED in crond local; do
+    kr_plain "/etc/init.d/$KP_SHARED" && [ -x "/etc/init.d/$KP_SHARED" ] || { kr_error 'required OpenRC shared service is unavailable'; return 1; }
+    case "$(service_state "$KP_SHARED")" in 0|3) :;; *) kr_error 'shared service is in an uncertain or transitional state'; return 1;; esac
+    for KP_LEVEL in $(runlevels_for "$KP_SHARED"); do valid_name "$KP_LEVEL" || return 1; done
+  done
+  for KP_PATH in /etc/init.d/earnapp /etc/conf.d/earnapp /etc/init.d/kaleno /etc/conf.d/kaleno "$SUITE_REGISTRY" "$NAMING_REGISTRY"; do kr_plain "$KP_PATH" || return 1; done
+  if [ -f /etc/crontabs/root ]; then kr_cron_filter check /etc/crontabs/root >/dev/null || return 1; fi
+  for KP_FILE in /etc/local.d/*.start /etc/init.d/* /etc/conf.d/* /etc/crontabs/* /etc/crontab /etc/cron.d/*; do
+    exists "$KP_FILE" || continue
+    case "$KP_FILE" in /etc/local.d/pavri.start|/etc/local.d/earnapp-limit.start|/etc/init.d/earnapp|/etc/conf.d/earnapp|/etc/init.d/kaleno|/etc/conf.d/kaleno|/etc/crontabs/root|/etc/init.d/xray-runtime) continue;; esac
+    if grep -Eq '/usr/local/(lib/(mivora\.sh|vesari)|sbin/(selnu|tavik|loren|earnapp-watchdog|earnapp-recover|earnapp-limit))|/opt/xray-runtime|/usr/local/sbin/xray-maintenance' "$KP_FILE"; then
+      kr_error 'an unrecognized service or hook references maintenance files'; return 1
+    fi
+  done
+}
+kr_lock_guard(){
+  kr_plain "$1" || return 1
+  if exists "$1"; then
+    KLG_MODE=$(stat -c %a "$1") || return 1
+    [ "$((0$KLG_MODE & 022))" = 0 ] || return 1
+  fi
+}
+kr_opened_lock(){
+  kr_lock_guard "$1" || return 1
+  [ "$(readlink "/proc/self/fd/$2")" = "$1" ] || return 1
+  [ "$(stat -Lc '%d:%i' "/proc/self/fd/$2")" = "$(stat -c '%d:%i' "$1")" ]
+}
+kr_lock(){
+  for KL_PATH in "$KR_SETUP_LOCK" /run/earnapp-maintenance.setup.lock; do
+    mkdir "$KL_PATH" || { kr_error 'setup lock is occupied; no automatic lock removal'; return 1; }
+    KE_LOCK_DIRS="$KL_PATH ${KE_LOCK_DIRS:-}"
+  done
+  kr_lock_guard /run/earnapp-maintenance.lockfile && exec 8>>/run/earnapp-maintenance.lockfile
+  kr_opened_lock /run/earnapp-maintenance.lockfile 8 && flock -n 8 || return 1
+  kr_lock_guard /run/earnapp-setup.lockfile && exec 6>>/run/earnapp-setup.lockfile
+  kr_opened_lock /run/earnapp-setup.lockfile 6 && flock -n 6
+}
+kr_pause(){
+  kr_phase pausing || return 1
+  kr_mutate /etc/crontabs/root "$KE_B/sealed/cron.paused" 600 || return 1
+  for KP_PATH in /usr/local/sbin/earnapp-watchdog /usr/local/sbin/earnapp-recover /usr/local/sbin/earnapp-limit /etc/local.d/earnapp-limit.start /usr/local/sbin/selnu /usr/local/sbin/tavik /usr/local/sbin/loren /etc/local.d/pavri.start; do
+    ! exists "$KP_PATH" || kr_mutate "$KP_PATH" "$KE_B/sealed/pause" 755 || return 1
+  done
+  suite_wait_helpers || return 1
+  kr_lock_guard /run/earnapp-watchdog.lockfile && exec 7>>/run/earnapp-watchdog.lockfile
+  kr_opened_lock /run/earnapp-watchdog.lockfile 7 && flock -n 7 || return 1
+  kr_lock_guard /run/earnapp-maintenance.worker.lockfile && exec 9>>/run/earnapp-maintenance.worker.lockfile
+  kr_opened_lock /run/earnapp-maintenance.worker.lockfile 9 && flock -n 9 || return 1
+  kr_lock_guard "$KR_WORKER_LOCK" && exec 5>>"$KR_WORKER_LOCK"
+  kr_opened_lock "$KR_WORKER_LOCK" 5 && flock -n 5
+}
+kr_levels_set(){
+  KL_SVC=$1; KL_FILE=$2
+  runlevels_for "$KL_SVC" > "$KE_D/levels.current" || return 1
+  if ! grep -Fxq "LEVELS_TOUCHED $KL_SVC" "$KE_B/ledger"; then
+    cmp -s "$KE_D/levels.current" "$KE_B/sealed/$KL_SVC.runlevels" || return 1
+    printf 'LEVELS_TOUCHED %s\n' "$KL_SVC" >> "$KE_B/ledger" || return 1
+  fi
+  for KL_LEVEL in $(runlevels_for "$KL_SVC"); do
+    valid_name "$KL_LEVEL" || return 1
+    grep -Fxq "$KL_LEVEL" "$KE_B/sealed/$KL_SVC.runlevels" || grep -Fxq "LEVEL_ADD $KL_SVC $KL_LEVEL" "$KE_B/ledger" || return 1
+    [ -L "/etc/runlevels/$KL_LEVEL/$KL_SVC" ] && [ "$(readlink -f "/etc/runlevels/$KL_LEVEL/$KL_SVC")" = "/etc/init.d/$KL_SVC" ] || return 1
+    if ! grep -Fxq "$KL_LEVEL" "$KL_FILE"; then
+      printf 'LEVEL_DEL %s %s\n' "$KL_SVC" "$KL_LEVEL" >> "$KE_B/ledger" || return 1
+      rc-update del "$KL_SVC" "$KL_LEVEL" 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    fi
+  done
+  while IFS= read -r KL_LEVEL; do
+    valid_name "$KL_LEVEL" || return 1
+    if ! exists "/etc/runlevels/$KL_LEVEL/$KL_SVC"; then
+      printf 'LEVEL_ADD %s %s\n' "$KL_SVC" "$KL_LEVEL" >> "$KE_B/ledger" || return 1
+      rc-update add "$KL_SVC" "$KL_LEVEL" 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    fi
+  done < "$KL_FILE"
+}
+kr_prerequisites_apply(){
+  for KQ_SVC in crond local; do
+    if ! grep -Fxq default "$KE_B/sealed/$KQ_SVC.runlevels"; then
+      ! exists "/etc/runlevels/default/$KQ_SVC" || return 1
+      printf 'ADD_SHARED_DEFAULT %s\n' "$KQ_SVC" >> "$KE_B/ledger" || return 1
+      rc-update add "$KQ_SVC" default 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    fi
+  done
+  if [ "$(cat "$KE_B/sealed/crond.status")" = 3 ]; then
+    [ "$(service_state crond)" = 3 ] || return 1
+    printf 'START_SHARED crond\n' >> "$KE_B/ledger" || return 1
+    timeout -k 5 30 rc-service crond start 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+  fi
+  # Running shared local would execute unrelated hooks. Own boot hook needs
+  # activation only; it is not run through the shared service during setup.
+  [ "$(service_state crond)" = 0 ] && exists /etc/runlevels/default/crond && exists /etc/runlevels/default/local
+}
+kr_prerequisites_restore(){
+  for KQ_SVC in crond local; do
+    if grep -Fxq "ADD_SHARED_DEFAULT $KQ_SVC" "$KE_B/ledger" && exists "/etc/runlevels/default/$KQ_SVC"; then
+      [ -L "/etc/runlevels/default/$KQ_SVC" ] && [ "$(readlink -f "/etc/runlevels/default/$KQ_SVC")" = "/etc/init.d/$KQ_SVC" ] || return 1
+      rc-update del "$KQ_SVC" default 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    fi
+  done
+  if grep -Fxq 'START_SHARED crond' "$KE_B/ledger" && [ "$(service_state crond)" = 0 ]; then
+    printf '%s\n' 'SHARED_PREREQUISITE_RETAINED=crond active; rollback never stops shared services.'
+  fi
+}
+kr_cleanup_state(){
+  ! exists "$KR_STATE" && return 0
+  kr_plain_path "$KR_STATE" && [ -d "$KR_STATE" ] && [ "$(stat -c %u "$KR_STATE")" = 0 ] || return 1
+  : > "$KE_D/state.remove"
+  for KCS_FILE in "$KR_STATE"/* "$KR_STATE"/.[!.]* "$KR_STATE"/..?*; do
+    exists "$KCS_FILE" || continue
+    case "${KCS_FILE##*/}" in count|attempt|connection-key|limit-key|limit-digest) :;; *) kr_error 'unknown runtime state retained'; return 1;; esac
+    KCS_FP=$(kr_fingerprint "$KCS_FILE") || return 1
+    printf '%s %s\n' "$KCS_FILE" "$KCS_FP" >> "$KE_D/state.remove" || return 1
+  done
+  while read -r KCS_FILE KCS_HASH KCS_MODE; do
+    [ "$(kr_fingerprint "$KCS_FILE")" = "$KCS_HASH $KCS_MODE" ] || return 1
+    printf 'REMOVE_OWNED_STATE %s %s %s\n' "$KCS_FILE" "$KCS_HASH" "$KCS_MODE" >> "$KE_B/ledger" || return 1
+    rm "$KCS_FILE" || return 1
+  done < "$KE_D/state.remove"
+  rmdir "$KR_STATE"
+}
+kr_snapshot(){
+  mkdir "$KE_B/sealed" "$KE_B/sealed/files" "$KE_B/sealed/runtime" "$KE_B/sealed/helpers" || return 1
+  : > "$KE_B/sealed/snapshot.manifest"; : > "$KE_B/sealed/plan.manifest"; : > "$KE_B/ledger"
+  printf '%s\n' "VERSION=$KR_VERSION" "MODE=$KE_MODE" "SOURCE_SERVICE=$KE_SOURCE_SERVICE" "SOURCE_PROGRAM=$KE_SOURCE_PROGRAM" "ORIGINAL=$KE_ORIGINAL" > "$KE_B/sealed/settings" || return 1
+  printf '%s\n' "${KE_DEPENDENCIES:-none}" > "$KE_B/sealed/dependency-changes" || return 1
+  printf '%s\n' "${KE_VENDOR_B:-none}" > "$KE_B/sealed/vendor-receipt" || return 1
+  printf '%s\n' "${KE_BACKUP_PARENT_CREATED:-none}" > "$KE_B/sealed/backup-parent-change" || return 1
+  printf '%s\n' "${KE_SOURCE_KEY:-absent}" > "$KE_B/sealed/source.key" || return 1
+  kr_identity_manifest "$KE_B/sealed/identity.manifest" && kr_foreign_manifest "$KE_B/sealed/foreign.manifest" || return 1
+  for KS_SVC in earnapp kaleno "$KR_SERVICE" crond local; do
+    runlevels_for "$KS_SVC" > "$KE_B/sealed/$KS_SVC.runlevels" || return 1
+    if exists "/etc/init.d/$KS_SVC"; then service_state "$KS_SVC" > "$KE_B/sealed/$KS_SVC.status"; else printf 'absent\n' > "$KE_B/sealed/$KS_SVC.status"; fi
+  done
+  kr_tables_snapshot "$KE_B/sealed" || return 1
+  for KS_PATH in /etc/crontabs/root "$SUITE_REGISTRY" "$NAMING_REGISTRY" "$KR_REGISTRY" "$KR_REGISTRY.pending" /etc/init.d/earnapp /etc/conf.d/earnapp /etc/init.d/kaleno /etc/conf.d/kaleno /usr/local/lib/vesari /etc/earnapp/maintenance.conf /etc/earnapp/watchdog.conf; do kr_record_path "$KS_PATH" || return 1; done
+  for KS_TAG in old-common old-watchdog old-recover old-limit old-boot common watchdog recover limit boot; do
+    KS_PATH=$(suite_path "$KS_TAG") || return 1
+    kr_record_path "$KS_PATH" || return 1
+  done
+  printf '%s\n' '#!/bin/sh' '# Transaction-owned maintenance pause.' 'exit 0' > "$KE_B/sealed/pause" || return 1
+  if [ -f /etc/crontabs/root ]; then kr_cron_filter paused /etc/crontabs/root > "$KE_B/sealed/cron.paused" || return 1
+  else : > "$KE_B/sealed/cron.paused"; fi
+  cp "$KE_B/sealed/cron.paused" "$KE_B/sealed/cron.final" || return 1
+  printf '%s\n' '*/2 * * * * /usr/local/sbin/selnu >/dev/null 2>&1 # XRAY-RUNTIME-WATCHDOG' >> "$KE_B/sealed/cron.final"
+}
+kr_stage(){
+  kr_stage_runtime "$KE_B/sealed/runtime" "$KE_ORIGINAL" "$KE_B/packages" || return 1
+  KS_PROGRAM_HASH=$(hash_file "$KE_B/sealed/runtime/xray") || return 1
+  kr_stage_helpers "$KE_B/sealed/helpers" "$KS_PROGRAM_HASH" || return 1
+  kr_emit_init > "$KE_B/sealed/init" && chmod 755 "$KE_B/sealed/init" || return 1
+  KS_OLD_CONFIG=
+  [ ! -f /etc/earnapp/maintenance.conf ] || KS_OLD_CONFIG=/etc/earnapp/maintenance.conf
+  [ -n "$KS_OLD_CONFIG" ] || { [ ! -f /etc/earnapp/watchdog.conf ] || KS_OLD_CONFIG=/etc/earnapp/watchdog.conf; }
+  if [ -n "$KS_OLD_CONFIG" ] && kr_config_known_legacy_defaults "$KS_OLD_CONFIG"; then
+    printf '%s\n' 'CONFIG_POLICY=known legacy defaults normalized to canonical defaults.'
+    KS_OLD_CONFIG=
+  fi
+  kr_emit_config "$KE_B/sealed/config" "$KS_OLD_CONFIG" || return 1
+  kr_runtime_fingerprint "$KE_B/sealed/runtime" > "$KE_B/sealed/runtime.fingerprint" || return 1
+  find "$KE_B/sealed/runtime" -type l | grep . >/dev/null && return 1
+  find "$KE_B/sealed/runtime" -type f | LC_ALL=C sort > "$KE_D/runtime.files" || return 1
+  while IFS= read -r KS_FILE; do
+    KS_REL=${KS_FILE#"$KE_B/sealed/runtime/"}
+    case "$KS_REL" in ''|/*|*..*|*[!A-Za-z0-9_./+-]*) return 1;; esac
+    KS_MODE=644; case "$KS_REL" in xray|ld.so) KS_MODE=755;; esac
+    kr_plan "$KR_HOME/$KS_REL" "$KS_FILE" "$KS_MODE" || return 1
+  done < "$KE_D/runtime.files"
+  for KS_TAG in common watchdog recover limit boot; do
+    sh -n "$KE_B/sealed/helpers/$KS_TAG" || return 1
+    KS_MODE=755; [ "$KS_TAG" != common ] || KS_MODE=644
+    kr_plan "$(suite_path "$KS_TAG")" "$KE_B/sealed/helpers/$KS_TAG" "$KS_MODE" || return 1
+  done
+  kr_plan "/etc/init.d/$KR_SERVICE" "$KE_B/sealed/init" 755 && kr_plan "$KR_CONFIG" "$KE_B/sealed/config" 644 || return 1
+  kr_plain "$0" && cp "$0" "$KE_B/sealed/entry" && sh -n "$KE_B/sealed/entry" || return 1
+  kr_plan "$KR_ENTRY" "$KE_B/sealed/entry" 755 || return 1
+  for KS_TAG in old-common old-watchdog old-recover old-limit old-boot; do kr_plan "$(suite_path "$KS_TAG")" - - || return 1; done
+  for KS_PATH in "$SUITE_REGISTRY" "$NAMING_REGISTRY" /etc/earnapp/maintenance.conf /etc/earnapp/watchdog.conf; do kr_plan "$KS_PATH" - - || return 1; done
+  if [ "$KE_MODE" = named ]; then
+    for KS_PATH in /usr/local/lib/vesari /etc/init.d/kaleno /etc/conf.d/kaleno; do kr_plan "$KS_PATH" - - || return 1; done
+  fi
+  printf 'default\n' > "$KE_B/sealed/canonical.runlevels"; : > "$KE_B/sealed/empty.runlevels"
+  # Seal all bytes before any maintenance pause or source stop.
+  (cd "$KE_B/sealed" && find . -type f ! -name seal > "$KE_D/seal.files.raw" && LC_ALL=C sort "$KE_D/seal.files.raw" > "$KE_D/seal.files" &&
+    while IFS= read -r KS_FILE; do sha256sum "$KS_FILE" || exit 1; done < "$KE_D/seal.files" > seal) || return 1
+  KE_SEAL=$(hash_file "$KE_B/sealed/seal") || return 1
+  printf 'RECEIPT=%s\nSEAL=%s\n' "$KE_B" "$KE_SEAL" > "$KE_B/registry.record" || return 1
+  kr_phase prepared
+}
+kr_config_known_legacy_defaults(){
+  suite_config_valid "$1" || return 1
+  awk '
+    BEGIN{n=split("UDP_THRESHOLD FD_THRESHOLD RSS_THRESHOLD_KB ZERO_MAX_BAD RESOURCE_MAX_BAD MIN_UPTIME RESTART_COOLDOWN",k," ");split("250 512 184320 2 3 120 300",v," ");for(i=1;i<=n;i++)want[k[i]]=v[i]}
+    /^[[:space:]]*#/||/^[[:space:]]*$/{next}
+    {split($0,a,"=");if(!(a[1] in want)||a[2]!=want[a[1]]||seen[a[1]]++)bad=1;count++}
+    END{exit bad||count!=7}' "$1"
+}
+kr_baseline_check(){
+  while read -r KB_PATH KB_HASH KB_MODE; do
+    [ "$(kr_fingerprint "$KB_PATH")" = "$KB_HASH $KB_MODE" ] || return 1
+  done < "$KE_B/sealed/snapshot.manifest"
+  for KB_SVC in earnapp kaleno "$KR_SERVICE" crond local; do
+    runlevels_for "$KB_SVC" > "$KE_D/levels.baseline" || return 1
+    cmp -s "$KE_D/levels.baseline" "$KE_B/sealed/$KB_SVC.runlevels" || return 1
+  done
+  kr_identity_check && kr_foreign_check && kr_tables_unchanged || return 1
+  [ -z "${KE_SOURCE_KEY:-}" ] || [ "$(kr_source_worker)" = "$KE_SOURCE_KEY" ]
+}
+kr_wait_candidate(){
+  KW_N=0
+  while [ "$KW_N" -lt 15 ]; do
+    kr_candidate_worker >/dev/null 2>&1 && return 0
+    KW_N=$((KW_N+1)); [ "$KW_N" = 15 ] || sleep 1
+  done
+  return 1
+}
+kr_wait_connection(){
+  KWC_N=0; KWC_GOOD=0; KWC_PREVIOUS=
+  while [ "$KWC_N" -lt 45 ]; do
+    KWC_KEY=$(kr_candidate_worker) || return 1
+    KWC_ESTAB=$(kr_candidate_connection) || return 1
+    case "$KWC_ESTAB" in ''|*[!0-9]*) return 1;; esac
+    if [ "$KWC_ESTAB" -gt 0 ]; then
+      if [ "$KWC_KEY" = "$KWC_PREVIOUS" ]; then KWC_GOOD=$((KWC_GOOD+1)); else KWC_GOOD=1; fi
+      [ "$KWC_GOOD" -lt 3 ] || return 0
+    else KWC_GOOD=0; fi
+    KWC_PREVIOUS=$KWC_KEY; KWC_N=$((KWC_N+1)); [ "$KWC_N" = 45 ] || sleep 1
+  done
+  return 21
+}
+kr_outcome(){
+  kr_static_current || return 1
+  if [ ! -s /etc/earnapp/registered ]; then printf '%s\n' 'INSTALL_STATE=NEEDS_REGISTRATION' 'REGISTRATION=Use the original SDK account linking workflow; device values are not logged.'; return 20; fi
+  KO_STATE=$(kr_source_state) || return 1
+  if [ "$KO_STATE" = disabled ]; then printf '%s\n' 'INSTALL_STATE=SDK_DISABLED'; return 22; fi
+  [ "$KO_STATE" = enabled ] || return 1
+  if [ "$(sed -n 's/^MODE=//p' "$KE_B/sealed/settings")" = fresh ] && [ "$(service_state "$KR_SERVICE")" = 3 ] && kr_candidate_absent; then
+    printf '%s\n' 'INSTALL_STATE=START_PENDING' 'CONNECTION_STATE=PENDING'; return 21
+  fi
+  if ! kr_candidate_worker >/dev/null 2>&1; then
+    return 1
+  fi
+  kr_verify_limiter || return 1
+  KO_ESTAB=$(kr_candidate_connection) || return 1
+  case "$KO_ESTAB" in ''|*[!0-9]*) return 1;; esac
+  if [ "$KO_ESTAB" -gt 0 ]; then printf 'INSTALL_STATE=COMPLETE\nCONNECTION_STATE=ESTABLISHED\nVERSION=%s\nSERVICE=%s\nPROGRAM=%s\nBACKUP=%s\n' "$KR_VERSION" "$KR_SERVICE" "$KR_PROGRAM" "$KE_B"; return 0; fi
+  printf 'INSTALL_STATE=HEALTHY_PENDING\nCONNECTION_STATE=PENDING\nVERSION=%s\nBACKUP=%s\n' "$KR_VERSION" "$KE_B"; return 21
+}
+kr_resume_undo(){
+  if ! kr_candidate_absent; then
+    kr_candidate_worker stop >/dev/null || return 1
+    timeout -k 5 30 rc-service "$KR_SERVICE" stop 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    kr_candidate_absent || return 1
+  fi
+  kr_clear_table "$KR_TABLE" "$KR_SERVICE" && kr_cleanup_state || return 1
+  kr_mutate "$KR_REGISTRY.pending" - - && kr_phase active || return 1
+  printf 'RESUME_UNDONE\n' >> "$KE_B/ledger"
+}
+kr_resume_pending(){
+  require_root && kr_lock || return 1
+  kr_load_receipt "$KR_REGISTRY" || return 1
+  [ "$KE_MODE" = fresh ] || return 1
+  KE_SOURCE_PROGRAM=$KR_PROGRAM; KE_SOURCE_SERVICE=$KR_SERVICE
+  kr_static_current && [ -s /etc/earnapp/registered ] && [ "$(kr_source_state)" = enabled ] || return 1
+  suite_wait_helpers || return 1
+  kr_lock_guard /run/earnapp-watchdog.lockfile && exec 7>>/run/earnapp-watchdog.lockfile
+  kr_opened_lock /run/earnapp-watchdog.lockfile 7 && flock -n 7 || return 1
+  kr_lock_guard /run/earnapp-maintenance.worker.lockfile && exec 9>>/run/earnapp-maintenance.worker.lockfile
+  kr_opened_lock /run/earnapp-maintenance.worker.lockfile 9 && flock -n 9 || return 1
+  kr_lock_guard "$KR_WORKER_LOCK" && exec 5>>"$KR_WORKER_LOCK"
+  kr_opened_lock "$KR_WORKER_LOCK" 5 && flock -n 5 || return 1
+  kr_static_current || return 1
+  if kr_candidate_worker >/dev/null 2>&1; then kr_outcome; return $?; fi
+  [ "$(service_state "$KR_SERVICE")" = 3 ] && kr_candidate_absent || return 1
+  printf 'RESUME_INTENT\n' >> "$KE_B/ledger" || return 1
+  kr_mutate "$KR_REGISTRY.pending" "$KE_B/registry.record" 600 || return 1
+  KE_RESUME=1
+  kr_phase canonical-start-intent && printf 'START_CANONICAL\n' >> "$KE_B/ledger" || return 1
+  timeout -k 5 30 rc-service "$KR_SERVICE" start 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+  kr_wait_candidate && /usr/local/sbin/loren --locked 20 9>&5 5>&- 6>&- 7>&- 8>&- >/dev/null 2>&1 && kr_verify_limiter || return 1
+  KR_RESUME_RC=0; kr_wait_connection || KR_RESUME_RC=$?
+  case "$KR_RESUME_RC" in 0|21) :;; *) return 1;; esac
+  kr_static_current && kr_mutate "$KR_REGISTRY.pending" - - && kr_phase active || return 1
+  printf 'RESUME_COMMITTED\n' >> "$KE_B/ledger" || return 1
+  KE_RESUME=0
+  printf '%s\n' 'REGISTRATION_RESUMED=VERIFIED'
+  kr_outcome
+}
+kr_restore_transaction(){
+  # Validate every target before touching a candidate or a healthy source.
+  kr_load_receipt "$KE_B/registry.record" || return 1
+  while read -r KR_PATH KR_HASH KR_MODE; do kr_allowed "$KR_PATH" || return 1; done < "$KE_B/sealed/snapshot.manifest"
+  kr_identity_check && kr_foreign_check || return 1
+  kr_phase restoring || return 1
+  # A prepared/pausing transaction has never attempted candidate startup.
+  if grep -Fxq 'START_CANONICAL' "$KE_B/ledger"; then
+    if ! kr_candidate_absent >/dev/null 2>&1; then
+      kr_candidate_worker stop >/dev/null || { kr_error 'candidate process identity is unknown; no blind stop'; return 1; }
+      timeout -k 5 30 rc-service "$KR_SERVICE" stop 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+      kr_candidate_absent || return 1
+    fi
+    printf 'CANONICAL_STOPPED_VERIFIED\n' >> "$KE_B/ledger" || return 1
+  fi
+  kr_clear_table "$KR_TABLE" "$KR_SERVICE" || return 1
+  kr_cleanup_state || return 1
+  kr_levels_set "$KR_SERVICE" "$KE_B/sealed/$KR_SERVICE.runlevels" || return 1
+  # Preserve paused cron until source protection is rebuilt with the new inode.
+  while read -r KR_PATH KR_HASH KR_MODE; do
+    case "$KR_PATH" in /etc/crontabs/root|"$KR_REGISTRY"|"$KR_REGISTRY.pending") continue;; esac
+    if [ "$KR_HASH" = - ]; then kr_mutate "$KR_PATH" - - || return 1
+    else kr_mutate "$KR_PATH" "$KE_B/sealed/files$KR_PATH" "$KR_MODE" || return 1; fi
+  done < "$KE_B/sealed/snapshot.manifest"
+  kr_levels_set earnapp "$KE_B/sealed/earnapp.runlevels" && kr_levels_set kaleno "$KE_B/sealed/kaleno.runlevels" || return 1
+  if grep -Fxq STOP_SOURCE "$KE_B/ledger"; then
+    if ! kr_source_worker >/dev/null 2>&1; then
+      kr_source_absent && [ "$(service_state "$KE_SOURCE_SERVICE")" = 3 ] || return 1
+      timeout -k 5 30 rc-service "$KE_SOURCE_SERVICE" start 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    fi
+    kr_source_worker >/dev/null || return 1
+    if [ "$KE_MODE" = named ] || [ "$KE_MODE" = managed ]; then
+      /usr/local/sbin/loren --locked 20 5>&- 6>&- >/dev/null 2>&1 || return 1
+      KR_KEY=$(kr_source_worker) && naming_verify_limiter "$KE_SOURCE_SERVICE" "$KR_KEY" || return 1
+    elif [ -f "$KE_B/sealed/earnapp_limit.nft" ] || [ -f "$KE_B/sealed/earnapp_maintenance.nft" ]; then
+      # A supported historical limiter must regenerate against this incarnation.
+      [ -x /usr/local/sbin/earnapp-limit ] || return 1
+      /usr/local/sbin/earnapp-limit --locked 20 9>&7 5>&- 6>&- 7>&- 8>&- >/dev/null 2>&1 || return 1
+    fi
+  fi
+  kr_identity_check && kr_foreign_check && kr_prerequisites_restore || return 1
+  KR_CRON=$(kr_expected /etc/crontabs/root "$KE_B/sealed/snapshot.manifest") || return 1
+  if [ "$KR_CRON" = '- -' ]; then kr_mutate /etc/crontabs/root - - || return 1
+  else kr_mutate /etc/crontabs/root "$KE_B/sealed/files/etc/crontabs/root" "${KR_CRON#* }" || return 1; fi
+  for KR_PATH in "$KR_REGISTRY" "$KR_REGISTRY.pending"; do
+    KR_OLD=$(kr_expected "$KR_PATH" "$KE_B/sealed/snapshot.manifest") || return 1
+    if [ "$KR_OLD" = '- -' ]; then kr_mutate "$KR_PATH" - - || return 1
+    else kr_mutate "$KR_PATH" "$KE_B/sealed/files$KR_PATH" "${KR_OLD#* }" || return 1; fi
+  done
+  # Only empty directories journaled by this transaction are removable.
+  awk '$1=="MKDIR"{print $2}' "$KE_B/ledger" | LC_ALL=C sort -r > "$KE_D/dirs.remove"
+  while IFS= read -r KR_DIR; do
+    valid_path "$KR_DIR" && kr_plain_path "$KR_DIR" || return 1
+    # rmdir never removes contents and cannot remove a directory in use.
+    rmdir "$KR_DIR" 2>/dev/null || true
+  done < "$KE_D/dirs.remove"
+  kr_phase restored || return 1
+  printf 'RESTORE_STATE=RESTORED\nBACKUP=%s\n' "$KE_B"
+  [ "$KE_MODE" != fresh ] || printf '%s\n' 'VENDOR_SIDE_EFFECTS=RETAINED; original SDK and identity remain; vendor bootstrap side effects are not claimed reversed.'
+  [ "$(cat "$KE_B/sealed/dependency-changes")" = none ] || printf '%s\n' 'DEPENDENCY_PACKAGES=RETAINED; package removal is outside restore scope.'
+}
+kr_exit(){
+  KX_RC=$?; trap - 0 HUP INT TERM
+  if [ "${KE_RESUME:-0}" = 1 ]; then
+    kr_resume_undo || printf '%s\n' 'FAIL: pending registration resume stopped on unknown state; pending receipt retained.' >&2
+  fi
+  if [ "${KE_TX:-0}" = 1 ] && [ "$KX_RC" != 0 ]; then
+    printf '%s\n' 'Transaction interrupted or validation failed; restoring the sealed previous state.' >&2
+    if ! kr_restore_transaction; then printf '%s\n' 'FAIL: automatic rollback stopped on unknown state; receipt and pending pointer retained for review.' >&2; fi
+  fi
+  for KX_DIR in ${KE_LOCK_DIRS:-}; do rmdir "$KX_DIR" 2>/dev/null || true; done
+  if [ -n "${KE_D:-}" ]; then
+    case "$KE_D" in /tmp/xray-runtime-*) rm -rf "$KE_D";; esac
+  fi
+  exit "$KX_RC"
+}
+kr_context(){
+  umask 077; KE_TX=0; KE_RESUME=0; KE_LOCK_DIRS=
+  KE_D=$(mktemp -d /tmp/xray-runtime-XXXXXXXX) || return 1
+  U_D=$KE_D
+  trap kr_exit 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+}
+kr_engine_precheck() (
+  kr_context && kr_dependency_prepare check && kr_preconditions && kr_detect || exit "$?"
+  if [ "$KE_MODE" = current ]; then kr_outcome; exit "$?"; fi
+  printf 'PRECHECK_STATE=READY\nMODE=%s\nTARGET_SERVICE=%s\nTARGET_PROGRAM=%s\n' "$KE_MODE" "$KR_SERVICE" "$KR_PROGRAM"
+  if ! exists /etc/runlevels/default/crond || ! exists /etc/runlevels/default/local || [ "$(service_state crond)" != 0 ]; then
+    printf '%s\n' 'PLANNED_SHARED_PREREQUISITES=activate crond/local default; start crond if stopped; rollback removes only owned activation and retains shared service.'
+  fi
+  if [ "$KE_MODE" = fresh ]; then printf '%s\n' 'VENDOR_BOOTSTRAP=REQUIRED; SDK and vendor side effects are retained on fresh restore.'; fi
+)
+kr_engine_status() (
+  require_root && kr_context && kr_dependency_prepare check && kr_preconditions && kr_detect || exit "$?"
+  [ "$KE_MODE" = current ] || { printf 'INSTALL_STATE=NOT_CURRENT\nMODE=%s\n' "$KE_MODE"; exit 1; }
+  kr_outcome
+)
+kr_engine_install() (
+  kr_context || exit 1
+  [ "$(uname -m)" = x86_64 ] && [ -f /etc/alpine-release ] || exit 1
+  if [ "$APPLY" = 1 ] && ! exists "$KR_REGISTRY" && ! exists "$KR_REGISTRY.pending"; then
+    kr_dependency_prepare apply || exit "$?"
+  else kr_dependency_prepare check || exit "$?"; fi
+  kr_preconditions && kr_detect || exit "$?"
+  if [ "$KE_MODE" = current ]; then
+    if [ "$APPLY" = 1 ] && [ "$(sed -n 's/^MODE=//p' "$KE_B/sealed/settings")" = fresh ] &&
+       [ -s /etc/earnapp/registered ] && [ "$(kr_source_state)" = enabled ] && [ "$(service_state "$KR_SERVICE")" = 3 ]; then
+      kr_resume_pending; exit "$?"
+    fi
+    KE_CURRENT_RC=0; kr_outcome || KE_CURRENT_RC=$?
+    case "$KE_CURRENT_RC" in 0|20|21|22) printf '%s\n' 'ALREADY_CURRENT=VERIFIED_NOOP';; esac
+    exit "$KE_CURRENT_RC"
+  fi
+  [ "$APPLY" = 1 ] || { printf 'DRY_RUN=1\nMODE=%s\nTARGET=%s\n' "$KE_MODE" "$KR_PROGRAM"; exit 0; }
+  require_root && kr_lock && kr_detect || exit "$?"
+  if [ "$KE_MODE" = fresh ]; then
+    # Boundary is pinned in legacy-core. Its output can contain account links.
+    kr_vendor_prepare || exit 1
+    SDK_BIN=/usr/bin/earnapp
+    mkdir "$KE_VENDOR_B/bootstrap-work" || exit 1
+    U_D=$KE_VENDOR_B/bootstrap-work
+    KB_RC=0; suite_bootstrap 5>&- 6>&- 7>&- 8>&- 9>&- > "$KE_VENDOR_B/vendor.private.log" 2>&1 || KB_RC=$?
+    U_D=$KE_D
+    case "$KB_RC" in 0|20) :;; *) kr_error 'vendor bootstrap failed; vendor SDK/identity side effects retained for review'; exit 1;; esac
+    [ -x /usr/bin/earnapp ] && kr_plain /usr/bin/earnapp || exit 1
+    # Only a newly created updater with the strict known scalar contract is owned.
+    UPDATER_MAIN_SVC=earnapp; kr_vendor_quiesce || { kr_error 'vendor updater active or unknown; explicit updater review is required'; exit 1; }
+    if exists /etc/init.d/earnapp; then
+      (SDK_BIN=/usr/bin/earnapp; OLD_SVC=earnapp; suite_source_init_valid /etc/init.d/earnapp && suite_source_config_valid) || exit 1
+      KE_SOURCE_KEY=$(kr_source_worker 2>/dev/null) || {
+        KE_SOURCE_KEY=
+        kr_source_absent || { kr_error 'fresh vendor source has unknown processes; retained before canonical transaction'; exit 1; }
+      }
+    fi
+    KE_SDK_STATE=$(kr_source_state) || exit 1
+  fi
+  kr_backup_parent || exit 1
+  KE_B=$(mktemp -d "${KR_BACKUP_PREFIX}$(date -u +%Y%m%d-%H%M%S)-XXXXXXXX") || exit 1
+  mkdir "$KE_B/packages" || exit 1
+  kr_snapshot && kr_stage && kr_baseline_check || exit 1
+  KE_TX=1
+  kr_mutate "$KR_REGISTRY.pending" "$KE_B/registry.record" 600 || exit 1
+  # The pkg SDK must see its own executable at the final interpreter path.
+  # Publish only the sealed private runtime and validate it while source is live.
+  while read -r KP_PATH KP_HASH KP_MODE KP_SOURCE; do
+    case "$KP_PATH" in "$KR_HOME"/*) kr_mutate "$KP_PATH" "$KE_B/sealed/$KP_SOURCE" "$KP_MODE" || exit 1;; esac
+  done < "$KE_B/sealed/plan.manifest"
+  kr_runtime_live_valid "$KR_HOME" && (KE_SOURCE_PROGRAM=$KR_PROGRAM; kr_identity_check) || exit 1
+  kr_prerequisites_apply && kr_pause || exit 1
+  kr_identity_check && kr_foreign_check && kr_tables_unchanged || exit 1
+  for KP_SVC in earnapp kaleno "$KR_SERVICE"; do
+    runlevels_for "$KP_SVC" > "$KE_D/levels.before-stop" || exit 1
+    cmp -s "$KE_D/levels.before-stop" "$KE_B/sealed/$KP_SVC.runlevels" || exit 1
+  done
+  if [ -n "${KE_SOURCE_KEY:-}" ]; then
+    [ "$(kr_source_worker)" = "$KE_SOURCE_KEY" ] || exit 1
+    kr_phase source-stop-intent && printf 'STOP_SOURCE\n' >> "$KE_B/ledger" || exit 1
+    timeout -k 5 30 rc-service "$KE_SOURCE_SERVICE" stop 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || exit 1
+    kr_source_absent || exit 1
+  fi
+  kr_phase source-stopped || exit 1
+  kr_levels_set earnapp "$KE_B/sealed/empty.runlevels" && kr_levels_set kaleno "$KE_B/sealed/empty.runlevels" || exit 1
+  kr_clear_table earnapp_limit earnapp && kr_clear_table earnapp_maintenance "$KE_SOURCE_SERVICE" || exit 1
+  kr_phase publishing || exit 1
+  while read -r KP_PATH KP_HASH KP_MODE KP_SOURCE; do
+    case "$KP_PATH" in "$KR_HOME"/*) continue;; esac
+    if [ "$KP_HASH" = - ]; then kr_mutate "$KP_PATH" - - || exit 1
+    else kr_mutate "$KP_PATH" "$KE_B/sealed/$KP_SOURCE" "$KP_MODE" || exit 1; fi
+  done < "$KE_B/sealed/plan.manifest"
+  kr_levels_set "$KR_SERVICE" "$KE_B/sealed/canonical.runlevels" || exit 1
+  KE_SOURCE_PROGRAM=$KR_PROGRAM; KE_SOURCE_SERVICE=$KR_SERVICE
+  kr_runtime_live_valid "$KR_HOME" && kr_identity_check && kr_foreign_check || exit 1
+  if [ -s /etc/earnapp/registered ] && [ "$(kr_source_state)" = enabled ]; then
+    kr_phase canonical-start-intent && printf 'START_CANONICAL\n' >> "$KE_B/ledger" || exit 1
+    timeout -k 5 30 rc-service "$KR_SERVICE" start 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || exit 1
+    kr_wait_candidate || exit 1
+    /usr/local/sbin/loren --locked 20 9>&5 5>&- 6>&- 7>&- 8>&- >/dev/null 2>&1 && kr_verify_limiter || exit 1
+    # A healthy source must be restored if its replacement has no connection.
+    KE_CONNECTION_RC=0; kr_wait_connection || KE_CONNECTION_RC=$?
+    case "$KE_CONNECTION_RC" in 0) :;; 21)
+      if [ "$KE_MODE" != fresh ]; then
+        printf '%s\n' 'CANDIDATE_STATE=HEALTHY_PENDING; previous verified source will be restored.' >&2; exit 21
+      fi;; *) exit 1;; esac
+  fi
+  kr_mutate /etc/crontabs/root "$KE_B/sealed/cron.final" 600 && kr_mutate "$KR_REGISTRY" "$KE_B/registry.record" 600 || exit 1
+  kr_mutate "$KR_REGISTRY.pending" - - && kr_phase active || exit 1
+  kr_static_current || exit 1
+  KE_TX=0
+  kr_outcome
+)
+kr_engine_restore() (
+  require_root && kr_context && kr_dependency_prepare check && kr_preconditions || exit 1
+  if exists "$KR_REGISTRY.pending"; then KR_POINTER=$KR_REGISTRY.pending
+  else KR_POINTER=$KR_REGISTRY; fi
+  kr_load_receipt "$KR_POINTER" || { kr_error 'no valid immediate transaction receipt'; exit 1; }
+  if [ "$APPLY" != 1 ]; then printf 'DRY_RUN=1\nRESTORE_BACKUP=%s\n' "$KE_B"; exit 0; fi
+  kr_lock || exit 1
+  kr_load_receipt "$KR_POINTER" || exit 1
+  kr_pause && kr_restore_transaction
+)
+kr_engine_names(){ printf 'VERSION=%s\nSERVICE=%s\nPROGRAM=%s\nCONFIG=%s\nREGISTRY=%s\nENTRY=%s\n' "$KR_VERSION" "$KR_SERVICE" "$KR_PROGRAM" "$KR_CONFIG" "$KR_REGISTRY" "$KR_ENTRY"; }
+kr_engine_diagnose() (
+  KD_SCOPE='DIAGNOSTIC_SCOPE=network exit only; SDK account region and earnings are unverified.'
+  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    printf 'DIAGNOSTIC_STATE=UNKNOWN\n%s\n' "$KD_SCOPE"; exit 24
+  fi
+  KD_IP=$(curl -q -4 --silent --fail --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 10 --max-filesize 1024 --url https://api.ipify.org 2>/dev/null) || {
+    printf 'DIAGNOSTIC_STATE=UNKNOWN\n%s\n' "$KD_SCOPE"; exit 24;
+  }
+  printf '%s\n' "$KD_IP" | awk -F. 'NR!=1||NF!=4{bad=1;next} {for(i=1;i<=4;i++)if($i!~/^[0-9]+$/||length($i)>3||$i+0>255)bad=1} END{exit bad||NR!=1}' || {
+    printf 'DIAGNOSTIC_STATE=UNKNOWN\n%s\n' "$KD_SCOPE"; exit 24;
+  }
+  KD_JSON=$(curl -q -4 --silent --fail --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 10 --max-filesize 4096 --url "https://ipwho.is/$KD_IP?fields=success,ip,country,country_code" 2>/dev/null) || {
+    printf 'DIAGNOSTIC_STATE=UNKNOWN\n%s\n' "$KD_SCOPE"; exit 24;
+  }
+  KD_VALID=$(printf '%s\n' "$KD_JSON" | jq -ser --arg expected "$KD_IP" '
+    if length==1 then .[0] else error("multiple diagnostic responses") end |
+    if .success==true and .ip==$expected and (.country|type)=="string" and
+       (.country_code|type)=="string" and (.country_code|test("^[A-Z]{2}$")) and
+       (.country|length)>0 and (.country|length)<=80 and
+       (.country|explode|all(.>=32 and .!=127))
+    then [.ip,.country_code,.country]|@tsv else error("invalid diagnostic response") end' 2>/dev/null) || {
+    printf 'DIAGNOSTIC_STATE=UNKNOWN\n%s\n' "$KD_SCOPE"; exit 24;
+  }
+  IFS=$(printf '\t') read -r KD_RETURNED_IP KD_COUNTRY_CODE KD_COUNTRY <<EOF
+$KD_VALID
+EOF
+  [ "$KD_RETURNED_IP" = "$KD_IP" ] || exit 24
+  printf 'DIAGNOSTIC_STATE=AVAILABLE\nIPV4=%s\nEXIT_COUNTRY_CODE=%s\nEXIT_COUNTRY=%s\n%s\n' "$KD_IP" "$KD_COUNTRY_CODE" "$KD_COUNTRY" "$KD_SCOPE"
+)
+unified_main(){
+  CMD=$1; APPLY=$2
+  case "$CMD" in install|setup) kr_engine_install;; precheck) kr_engine_precheck;; status) kr_engine_status;; restore) kr_engine_restore;; names) kr_engine_names;; diagnose) kr_engine_diagnose;; *) printf '%s\n' 'Usage: earnapp-maintenance.sh {install|precheck|status|restore|names|diagnose} [--apply]' >&2; return 64;; esac
+}
+
+unified_main "$CMD" "$APPLY"
+exit $?
