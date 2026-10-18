@@ -1,6 +1,6 @@
 #!/bin/sh
 # EarnApp maintenance: actual service identity, logs and recovery records retained.
-# Version 2026.10.18.4. Auxiliary filenames are documented by the names command.
+# Version 2026.10.18.5. Auxiliary filenames are documented by the names command.
 set -u
 SDK_BIN=${SDK_BIN:-}
 OLD_SVC=earnapp
@@ -399,17 +399,45 @@ suite_updater_meta_snapshot() (
     printf '%s|%s|%s|%s\n' "$NUM_SERVICE" "$NUM_CHILD" "$NUM_PATH" "$NUM_PARENT"
   done
 )
+suite_updater_systemd_inactive() (
+  # A retained unit is not an active service on an Alpine/OpenRC host.
+  # Prove the init/runtime context without invoking systemctl or service hooks.
+  [ -f /etc/alpine-release ] || { fail 'retained systemd updater units require Alpine/OpenRC'; exit 1; }
+  [ -d /run ] && [ -r /run ] && [ -x /run ] || { fail 'cannot inspect systemd runtime directory'; exit 1; }
+  if exists /run/systemd; then
+    [ -d /run/systemd ] && [ -r /run/systemd ] && [ -x /run/systemd ] || { fail 'cannot inspect systemd runtime directory'; exit 1; }
+  fi
+  if exists /run/systemd/system; then
+    fail 'systemd runtime state prevents inactive-updater verification'; exit 1
+  fi
+  NUD_EXE=$(readlink /proc/1/exe 2>/dev/null) || { fail 'cannot read PID 1 for retained systemd updater units'; exit 1; }
+  for NUD_INIT in /bin/busybox /sbin/openrc-init; do
+    [ -x "$NUD_INIT" ] || continue
+    NUD_CANON=$(readlink -f "$NUD_INIT") || exit 1
+    [ "$NUD_EXE" != "$NUD_CANON" ] || exit 0
+  done
+  fail 'PID 1 is not a recognized Alpine init for retained systemd updater units'
+  exit 1
+)
 suite_updater_entries() (
+  NUE_SYSTEMD_CHECKED=0
   for NUE_SERVICE in earnapp_upgrader earnapp-upgrader; do
-    for NUE_FILE in /etc/runlevels/*/"$NUE_SERVICE" "/etc/systemd/system/$NUE_SERVICE.service" "/usr/lib/systemd/system/$NUE_SERVICE.service" "/lib/systemd/system/$NUE_SERVICE.service"; do
-      exists "$NUE_FILE" && { fail "updater entry is still enabled/unsupported: $NUE_FILE"; exit 1; }
+    for NUE_FILE in /etc/runlevels/*/"$NUE_SERVICE"; do
+      exists "$NUE_FILE" && { fail "updater OpenRC entry is still enabled: $NUE_FILE"; exit 1; }
     done
-    for NUE_FILE in "/etc/init.d/$NUE_SERVICE" "/etc/conf.d/$NUE_SERVICE"; do
+    for NUE_FILE in "/etc/init.d/$NUE_SERVICE" "/etc/conf.d/$NUE_SERVICE" \
+        "/etc/systemd/system/$NUE_SERVICE.service" "/usr/lib/systemd/system/$NUE_SERVICE.service" "/lib/systemd/system/$NUE_SERVICE.service"; do
       exists "$NUE_FILE" || continue
       [ -f "$NUE_FILE" ] && [ ! -L "$NUE_FILE" ] && [ -r "$NUE_FILE" ] && [ "$(stat -c %u "$NUE_FILE")" = 0 ] || exit 1
       NUE_MODE=$(stat -c %a "$NUE_FILE") || exit 1
       case "$NUE_MODE" in ''|*[!0-7]*) exit 1;; esac
       [ "$((0$NUE_MODE & 022))" = 0 ] || exit 1
+      case "$NUE_FILE" in *.service)
+        if [ "$NUE_SYSTEMD_CHECKED" = 0 ]; then
+          suite_updater_systemd_inactive || exit 1
+          NUE_SYSTEMD_CHECKED=1
+        fi;;
+      esac
       NUE_HASH=$(hash_file "$NUE_FILE") || exit 1
       printf '%s|%s|%s\n' "$NUE_FILE" "$NUE_MODE" "$NUE_HASH"
     done
@@ -423,7 +451,10 @@ suite_updater_references() (
     case "$NUR_FILE" in /etc/init.d/earnapp_upgrader|/etc/init.d/earnapp-upgrader|/etc/conf.d/earnapp_upgrader|/etc/conf.d/earnapp-upgrader) continue;; esac
     [ -f "$NUR_FILE" ] && [ -r "$NUR_FILE" ] || exit 1
     NUR_CANON=$(readlink -f "$NUR_FILE") || exit 1
-    case "$NUR_CANON" in /etc/init.d/earnapp_upgrader|/etc/init.d/earnapp-upgrader|/etc/conf.d/earnapp_upgrader|/etc/conf.d/earnapp-upgrader)
+    case "$NUR_CANON" in /etc/init.d/earnapp_upgrader|/etc/init.d/earnapp-upgrader|/etc/conf.d/earnapp_upgrader|/etc/conf.d/earnapp-upgrader|\
+        /etc/systemd/system/earnapp_upgrader.service|/etc/systemd/system/earnapp-upgrader.service|\
+        /usr/lib/systemd/system/earnapp_upgrader.service|/usr/lib/systemd/system/earnapp-upgrader.service|\
+        /lib/systemd/system/earnapp_upgrader.service|/lib/systemd/system/earnapp-upgrader.service)
       fail "another entry aliases a retained updater: $NUR_FILE"; exit 1;;
     esac
     NUR_RC=0
@@ -1465,7 +1496,7 @@ EOF
 
 # Source module: maintenance-suite-module.sh
 # Transparent EarnApp helper maintenance transaction. Loaded after shared base/source/helper modules.
-SUITE_VERSION=2026.10.18.4
+SUITE_VERSION=2026.10.18.5
 SUITE_SERVICE=earnapp
 SUITE_REGISTRY=/var/lib/earnapp-maintenance/current
 
