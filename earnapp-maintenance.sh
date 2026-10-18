@@ -1,6 +1,6 @@
 #!/bin/sh
 # EarnApp maintenance: actual service identity, logs and recovery records retained.
-# Version 2026.10.18.3. Auxiliary filenames are documented by the names command.
+# Version 2026.10.18.4. Auxiliary filenames are documented by the names command.
 set -u
 SDK_BIN=${SDK_BIN:-}
 OLD_SVC=earnapp
@@ -61,7 +61,7 @@ discover_sdk(){
 }
 
 openrc_value() (
-  for OV_HELPER in /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
+  for OV_HELPER in /usr/libexec/rc/bin/service_get_value /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
     if [ -x "$OV_HELPER" ]; then RC_SVCNAME=$1 "$OV_HELPER" "$2"; exit $?; fi
   done
   OV_HELPER=$(command -v service_get_value) || exit 1
@@ -352,7 +352,7 @@ suite_updater_stopped() (
   # Alpine's established OpenRC state tree; do not execute an init status hook.
   [ "${RC_SVCDIR:-/run/openrc}" = /run/openrc ] && [ -d /run/openrc ] && [ -r /run/openrc ] && [ -x /run/openrc ] || exit 1
   NUS_HELPER=
-  for NUS_FILE in /lib/rc/bin/service_stopped /usr/lib/rc/bin/service_stopped; do
+  for NUS_FILE in /usr/libexec/rc/bin/service_stopped /lib/rc/bin/service_stopped /usr/lib/rc/bin/service_stopped; do
     [ ! -x "$NUS_FILE" ] || { NUS_HELPER=$NUS_FILE; break; }
   done
   [ -n "$NUS_HELPER" ] || NUS_HELPER=$(command -v service_stopped) || exit 1
@@ -370,7 +370,7 @@ suite_updater_stopped() (
 )
 suite_updater_meta_value() (
   NUM_HELPER=
-  for NUM_FILE in /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
+  for NUM_FILE in /usr/libexec/rc/bin/service_get_value /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
     [ ! -x "$NUM_FILE" ] || { NUM_HELPER=$NUM_FILE; break; }
   done
   [ -n "$NUM_HELPER" ] || NUM_HELPER=$(command -v service_get_value) || exit 1
@@ -621,7 +621,7 @@ HF_RESULT=$(sha256sum "$1" 2>/dev/null) || return 1
 printf '%s\n' "${HF_RESULT%% *}"
 }
 openrc_value() (
-for OV_HELPER in /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
+for OV_HELPER in /usr/libexec/rc/bin/service_get_value /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
 if [ -x "$OV_HELPER" ]; then RC_SVCNAME=$1 "$OV_HELPER" "$2" 6>&- 7>&- 8>&- 9>&-; exit $?; fi
 done
 OV_HELPER=$(command -v service_get_value) || exit 125
@@ -1289,7 +1289,7 @@ suite_source_scan() (
 )
 suite_source_meta_value() (
   NSG_HELPER=
-  for NSG_FILE in /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
+  for NSG_FILE in /usr/libexec/rc/bin/service_get_value /lib/rc/bin/service_get_value /usr/lib/rc/bin/service_get_value; do
     [ ! -x "$NSG_FILE" ] || { NSG_HELPER=$NSG_FILE; break; }
   done
   [ -n "$NSG_HELPER" ] || NSG_HELPER=$(command -v service_get_value) || exit 1
@@ -1465,7 +1465,7 @@ EOF
 
 # Source module: maintenance-suite-module.sh
 # Transparent EarnApp helper maintenance transaction. Loaded after shared base/source/helper modules.
-SUITE_VERSION=2026.10.18.3
+SUITE_VERSION=2026.10.18.4
 SUITE_SERVICE=earnapp
 SUITE_REGISTRY=/var/lib/earnapp-maintenance/current
 
