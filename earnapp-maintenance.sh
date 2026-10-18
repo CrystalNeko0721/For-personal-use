@@ -1,6 +1,6 @@
 #!/bin/sh
 # EarnApp maintenance: actual service identity, logs and recovery records retained.
-# Version 2026.10.18.2. Auxiliary filenames are documented by the names command.
+# Version 2026.10.18.3. Auxiliary filenames are documented by the names command.
 set -u
 SDK_BIN=${SDK_BIN:-}
 OLD_SVC=earnapp
@@ -1465,7 +1465,7 @@ EOF
 
 # Source module: maintenance-suite-module.sh
 # Transparent EarnApp helper maintenance transaction. Loaded after shared base/source/helper modules.
-SUITE_VERSION=2026.10.18.2
+SUITE_VERSION=2026.10.18.3
 SUITE_SERVICE=earnapp
 SUITE_REGISTRY=/var/lib/earnapp-maintenance/current
 
@@ -1601,15 +1601,79 @@ suite_check_owned(){
   [ "$SCO_COUNT" = 5 ] || { fail 'incomplete helper ownership record'; return 1; }
 }
 suite_table_owned(){
-  STO_TEXT=$(nft list table inet "$1" 2>/dev/null) || return 1
-  printf '%s\n' "$STO_TEXT" | awk -v table="$1" -v service="$2" -v prefix="$3" '
-    {s=$0;sub(/^[[:space:]]+/,"",s);sub(/[[:space:]]+$/, "",s)}
+  STO_TEXT=$(nft list table inet "$1") || { fail "cannot read nft table inet $1; rules retained"; return 2; }
+  if printf '%s\n' "$STO_TEXT" | awk -v table="$1" -v service="$2" -v prefix="$3" '
+    # This narrowly identifies the observed old marked-flow limiter. Numeric
+    # cgroup IDs identify the saved rule format, not the current live worker.
+    function uint64(s) {
+      return (s=="0" || s ~ /^[1-9][0-9]*$/) &&
+        (length(s)<20 || (length(s)==20 && ("u:" s)<=("u:18446744073709551615")))
+    }
+    function legacy(s, n,a) {
+      if(s=="")return
+      gsub(/[[:space:]]+/," ",s)
+      if(ls==0 && s=="table inet earnapp_limit {"){ls=1;return}
+      if(ls==1 && s=="chain output {"){ls=2;return}
+      if(ls==2 && (s=="type filter hook output priority -10; policy accept;" ||
+                   s=="type filter hook output priority filter - 10; policy accept;")){ls=3;return}
+      n=split(s,a," ")
+      if(ls==3 && n==12 && a[1]=="socket" && a[2]=="cgroupv2" && a[3]=="level" &&
+         a[4] ~ /^[1-9][0-9]*$/ && a[4]+0<=255 && uint64(a[5]) && a[5]!="0" &&
+         a[6]=="ct" && a[7]=="state" && a[8]=="new" && a[9]=="ct" &&
+         a[10]=="mark" && a[11]=="set" && a[12]=="0x000eaa20"){
+        ll=a[4];li=a[5];ls=4;return
+      }
+      if(ls==4 && n==21 && a[1]=="socket" && a[2]=="cgroupv2" && a[3]=="level" &&
+         ("l:" a[4])==("l:" ll) && ("i:" a[5])==("i:" li) &&
+         a[6]=="ct" && a[7]=="state" && a[8]=="new" && a[9]=="ct" &&
+         a[10]=="mark" && a[11]=="0x000eaa20" && a[12]=="ct" && a[13]=="count" &&
+         a[14]=="over" && a[15]=="20" && a[16]=="counter" && a[17]=="packets" &&
+         uint64(a[18]) && a[19]=="bytes" && uint64(a[20]) && a[21]=="reject"){
+        ls=5;return
+      }
+      if(ls==5 && s=="}"){ls=6;return}
+      if(ls==6 && s=="}"){ls=7;return}
+      lb=1
+    }
+    function numeric(s, n,a,tag) {
+      if(s=="")return
+      gsub(/[[:space:]]+/," ",s)
+      if(ns==0 && s=="table inet " table " {"){ns=1;return}
+      if(ns==1 && s=="chain output {"){ns=2;return}
+      if(ns==2 && (s=="type filter hook output priority -10; policy accept;" ||
+                   s=="type filter hook output priority filter - 10; policy accept;")){ns=3;return}
+      if(table=="earnapp_maintenance" && service=="earnapp" && prefix=="earnapp-maintenance-")tag="earnapp-maintenance-v5"
+      else if(table=="earnapp_limit" && service=="earnapp" && prefix=="earnapp-")tag="earnapp-v4"
+      n=split(s,a," ")
+      if(ns==3 && tag!="" && n==26 && a[1]=="socket" && a[2]=="cgroupv2" && a[3]=="level" &&
+         a[4] ~ /^[1-9][0-9]*$/ && a[4]+0<=255 && uint64(a[5]) && a[5]!="0" &&
+         a[6]=="meta" && a[7]=="l4proto" && a[8]=="{" && a[9]=="tcp," && a[10]=="udp" && a[11]=="}" &&
+         a[12]=="ct" && a[13]=="state" && a[14]=="new" && a[15]=="ct" && a[16]=="count" &&
+         a[17]=="over" && a[18] ~ /^[1-9][0-9]*$/ && a[18]+0<=100000 &&
+         (tag!="earnapp-v4" || a[18]=="20") && a[19]=="counter" && a[20]=="packets" &&
+         uint64(a[21]) && a[22]=="bytes" && uint64(a[23]) && a[24]=="reject" && a[25]=="comment" &&
+         a[26]==("\"" tag ":" a[5] ":" a[4] ":" a[18] "\"")){
+        ns=4;return
+      }
+      if(ns==4 && s=="}"){ns=5;return}
+      if(ns==5 && s=="}"){ns=6;return}
+      nb=1
+    }
+    {s=$0;sub(/^[[:space:]]+/,"",s);sub(/[[:space:]]+$/, "",s);legacy(s);numeric(s)}
     s=="" || s=="}" {next}
     s=="table inet " table " {" {t++;next}
     s=="chain output {" {c++;next}
     s ~ /^type filter hook output priority .*; policy accept;$/ {h++;next}
     index(s,"socket cgroupv2 level ")==1 && index(s,"openrc." service "\"") && index(s,"ct count over ") && index(s,"comment \"" prefix) {r++;next}
-    {bad=1} END{exit bad || t!=1 || c!=1 || h!=1 || r!=1}'
+    {bad=1}
+    END{
+      modern_ok=(!bad && t==1 && c==1 && h==1 && r==1)
+      legacy_ok=(table=="earnapp_limit" && service=="earnapp" && prefix=="earnapp-" && !lb && ls==7)
+      numeric_ok=(!nb && ns==6)
+      exit !(modern_ok || legacy_ok || numeric_ok)
+    }'; then return 0; fi
+  fail "unrecognized nft table format retained: inet $1"
+  return 1
 }
 suite_reject_sdk_copies(){
   [ -f "$SDK_BIN" ] || return 0
@@ -1691,10 +1755,11 @@ suite_preflight(){
       fail 'old node-suite node_limit table exists; retained without modification'; return 1
     fi
     if printf '%s\n' "$SP_TABLES" | grep -Fxq 'table inet earnapp_maintenance'; then
-      [ "$U_MODE" = managed ] && suite_table_owned earnapp_maintenance earnapp earnapp-maintenance- || { fail 'unowned/custom earnapp_maintenance table retained'; return 1; }
+      [ "$U_MODE" = managed ] || { fail 'unowned earnapp_maintenance table retained'; return 1; }
+      suite_table_owned earnapp_maintenance earnapp earnapp-maintenance- || return 1
     fi
     if printf '%s\n' "$SP_TABLES" | grep -Fxq 'table inet earnapp_limit'; then
-      suite_table_owned earnapp_limit earnapp earnapp- || { fail 'custom earnapp_limit rules retained'; return 1; }
+      suite_table_owned earnapp_limit earnapp earnapp- || return 1
     fi
   fi
   if ! discover_sdk >/dev/null 2>&1; then
@@ -1901,10 +1966,10 @@ suite_validate_live_tables(){
   SRT_SERVICE=$(awk -F= '$1=="SERVICE"{print $2}' "$U_B/settings") || return 1
   [ "$SRT_SERVICE" = "$SUITE_SERVICE" ] || return 1
   if printf '%s\n' "$SRT_TABLES" | grep -Fxq 'table inet earnapp_maintenance'; then
-    suite_table_owned earnapp_maintenance "$SRT_SERVICE" earnapp-maintenance- || { fail 'custom earnapp_maintenance rules retained during restore'; return 1; }
+    suite_table_owned earnapp_maintenance "$SRT_SERVICE" earnapp-maintenance- || return 1
   fi
   if printf '%s\n' "$SRT_TABLES" | grep -Fxq 'table inet earnapp_limit'; then
-    suite_table_owned earnapp_limit earnapp earnapp- || { fail 'custom earnapp_limit rules retained during restore'; return 1; }
+    suite_table_owned earnapp_limit earnapp earnapp- || return 1
   fi
   return 0
 }
@@ -2083,7 +2148,7 @@ cmd_suite_status() (
   SDK_BIN=$U_TARGET
   printf 'VERSION=%s\nSERVICE=%s\nPROGRAM=%s\nBACKUP=%s\n' "$U_CURRENT_VERSION" "$U_SERVICE" "$U_TARGET" "$U_PREVIOUS"
   suite_verify_runtime || exit 1
-  suite_table_owned earnapp_maintenance "$U_SERVICE" earnapp-maintenance- || { fail 'managed limiter rules are missing or changed'; exit 1; }
+  suite_table_owned earnapp_maintenance "$U_SERVICE" earnapp-maintenance- || exit 1
   [ -f /etc/crontabs/root ] && grep -Fxq '*/2 * * * * /usr/local/sbin/selnu >/dev/null 2>&1 # EARNAPP-MAINT-WATCHDOG' /etc/crontabs/root || { fail 'watchdog schedule is missing'; exit 1; }
   [ "$(service_state crond)" = 0 ] || { fail 'cron daemon is not running'; exit 1; }
   exists /etc/runlevels/default/crond && exists /etc/runlevels/default/local || { fail 'cron/limiter boot activation is missing'; exit 1; }
