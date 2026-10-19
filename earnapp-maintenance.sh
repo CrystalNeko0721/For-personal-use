@@ -1,5 +1,5 @@
 #!/bin/sh
-# EarnApp unified installer and maintenance, local candidate 2026.10.19.2.
+# EarnApp unified installer and maintenance, 2026.10.19.3.
 # Supports Alpine x86_64; original SDK and identity are retained for recovery.
 set -u
 SDK_BIN=${SDK_BIN:-}
@@ -475,7 +475,7 @@ suite_updater_references() (
     case "$NUR_RC" in 1) :;; 0) fail "another entry references the updater: $NUR_FILE"; exit 1;; *) exit 1;; esac
   done
 )
-suite_updater_run_argv() (
+suite_updater_absolute_run_argv() (
   NUA_PROC=$1; NUA_ARGS=$(tr '\000' '\n' <"$NUA_PROC/cmdline" 2>/dev/null) || exit 1
   NUA_FIRST=$(printf '%s\n' "$NUA_ARGS" | head -n 1); NUA_DIRECT=0
   if [ "$NUA_FIRST" = "$NUG_SDK" ] || [ "$NUA_FIRST" = "$NUG_CANON" ]; then NUA_DIRECT=1
@@ -1277,7 +1277,7 @@ suite_source_program() (
   [ ! -d "$NSP_PROC" ] && exit 1
   exit 2
 )
-suite_source_run_argv() (
+suite_source_absolute_run_argv() (
   NSA_PROC=$1
   NSA_ARGS=$(tr '\000' '\n' <"$NSA_PROC/cmdline" 2>/dev/null) || exit 1
   NSA_FIRST=$(printf '%s\n' "$NSA_ARGS" | head -n 1)
@@ -2774,7 +2774,7 @@ cmd_names(){
 
 # Private runtime for the pinned, unmodified-source EarnApp SDK, Alpine x86_64.
 # xray is an SDK copy with a bounded interpreter-field edit, not an Xray binary.
-KR_VERSION=2026.10.19.2
+KR_VERSION=2026.10.19.3
 KR_SERVICE=xray-runtime
 KR_HOME=/opt/xray-runtime
 KR_PROGRAM=/opt/xray-runtime/xray
@@ -2791,9 +2791,138 @@ KR_ENTRY=/usr/local/sbin/xray-maintenance
 KR_BACKUP_PREFIX=/var/backups/xray-runtime-
 KR_SDK_SHA=a5080f9eff9df9f59a2192ccafc344f06259bfffe2a0aee619d44c8cafbd8def
 KR_PATCHED_SHA=2868366c22c73f151682097f3774cb04fb6a001076ff43fd67942111c97ab9bb
+KR_SDK_SSL3_SHA=e7d6eea7c02e5c75676eeb8fde831e2a15f16f3a1c6176aa17ef93856209ab2f
+KR_PATCHED_SSL3_SHA=31e643887128e14cd9d5abffdeea41b96b032056b9b552dc09d38d93b6801528
 KR_SDK_URL=https://cdn-earnapp.b-cdn.net/static/earnapp-x64-1.665.73
 
-kr_error() { printf 'FAIL: runtime: %s\n' "$*" >&2; return 1; }
+# Original SDK bytes and interpreter-patched copies have distinct roles.
+kr_sdk_source_hash_valid() {
+  [ "$#" = 1 ] || return 1
+  case "$1" in "$KR_SDK_SHA"|"$KR_SDK_SSL3_SHA") return 0;; *) return 1;; esac
+}
+kr_patched_hash_valid() {
+  [ "$#" = 1 ] || return 1
+  case "$1" in "$KR_PATCHED_SHA"|"$KR_PATCHED_SSL3_SHA") return 0;; *) return 1;; esac
+}
+kr_select_sdk_profile() {
+  [ "$#" = 1 ] || return 1
+  case "$1" in
+    "$KR_SDK_SHA"|"$KR_PATCHED_SHA")
+      KR_PROFILE_SOURCE_SHA=$KR_SDK_SHA; KR_PROFILE_PATCHED_SHA=$KR_PATCHED_SHA
+      KR_PROFILE_INTERP_OFFSET=792; KR_PROFILE_INTERP_SIZE=28; KR_PROFILE_NEEDS_SSL=0;;
+    "$KR_SDK_SSL3_SHA"|"$KR_PATCHED_SSL3_SHA")
+      KR_PROFILE_SOURCE_SHA=$KR_SDK_SSL3_SHA; KR_PROFILE_PATCHED_SHA=$KR_PATCHED_SSL3_SHA
+      KR_PROFILE_INTERP_OFFSET=848; KR_PROFILE_INTERP_SIZE=28; KR_PROFILE_NEEDS_SSL=1;;
+    *) return 1;;
+  esac
+}
+
+# A defensive display filter for captured diagnostics. Operational helper logs
+# use the narrower event/field schema below rather than trusting vendor text.
+KR_REDACT_AWK='
+{
+  s=$0; gsub(/[[:cntrl:]]/, " ", s); lower=tolower(s)
+  if(lower ~ /^[[:space:]]*(device[ _-]*(id|uuid)|uuid|([a-z]+[ _-]*)?token|api[ _-]*key|secret|password|link[ _-]*url)[[:space:]:=]*$/){
+    print "[REDACTED_SENSITIVE_FIELD]";hide_next=1;next
+  }
+  if(hide_next && s !~ /^[[:space:]]*$/){print "[REDACTED_SENSITIVE_FIELD]";hide_next=0;next}
+  # Redact the remainder, including quoted values and authorization schemes.
+  if(match(lower, /(^|[^[:alnum:]_])(device[ _-]*(id|uuid)|uuid|([a-z]+[ _-]*)?token|api[ _-]*key|secret|password|authorization|cookie|link[ _-]*url)[[:space:]]*[:=]/))
+    s=substr(s,1,RSTART-1) " [REDACTED_SENSITIVE_FIELD]"
+  gsub(/[[:alpha:]][[:alnum:]+.-]*:\/\/[^[:space:]]+/, "[REDACTED_URL]", s)
+  rest=s; s=""
+  while(match(rest, /[[:alnum:]_+-]+/)){
+    token=substr(rest,RSTART,RLENGTH)
+    s=s substr(rest,1,RSTART-1)
+    if(length(token)>=24 && token !~ /^[A-Z_]+$/)s=s "[REDACTED_OPAQUE_VALUE]";else s=s token
+    rest=substr(rest,RSTART+RLENGTH)
+  }
+  print s rest
+}'
+kr_redact_stream() { LC_ALL=C awk "$KR_REDACT_AWK"; }
+kr_redact_message() {
+  printf '%s\n' "$*" | kr_redact_stream | LC_ALL=C awk '
+    {if(NR>1)s=s " ";s=s $0} END{print substr(s,1,1024)}'
+}
+kr_error() { kr_redact_message "FAIL: EarnApp runtime: $*" >&2; return 1; }
+
+# Only the two fixed application log names are writable. Keep the active inode
+# stable while locked, so concurrent callers cannot append to an old rotation.
+kr_emit_operation_logger() {
+  printf "KR_REDACT_AWK='%s'\n" "$KR_REDACT_AWK"
+  cat <<'KR_OPERATION_LOGGER'
+kr_redact_stream() { LC_ALL=C awk "$KR_REDACT_AWK"; }
+log_message() {
+  printf '%s\n' "$*" | LC_ALL=C awk '
+    BEGIN {
+      events=" BAD RECOVER RECOVERY_FAILED CONNECTION_CHECK_OK CONNECTION_PENDING LIMIT_UNAVAILABLE SDK_DISABLED SDK_UNREGISTERED SDK_STATE_UNKNOWN WORKER_OWNERSHIP_OR_COUNT_UNKNOWN AGE_PROBE_FAILED STATS_FAILED NETWORK_BAD LIMIT_MAINTENANCE_FAILED BAD_TRIGGER BAD_ARGUMENTS FALLBACK_START_FAILED FALLBACK_START_REFUSED SDK_CHANGED_OR_COOLDOWN WORKER_OR_FAULT_CHANGED SDK_CHANGED_BEFORE_STOP WORKER_OR_FAULT_CHANGED_BEFORE_STOP WORKER_CHANGED_BEFORE_STOP STOP_INCOMPLETE STOP_UNCONFIRMED SDK_CHANGED BANDWIDTH_REBIND_FAILED kh1_BANDWIDTH_REBIND_FAILED us6_BANDWIDTH_REBIND_FAILED START_REFUSED START_FAILED WORKER_CHANGED WORKER_OR_SDK_CHANGED WORKER_OR_FAULT_CHANGED FAULT_CHANGED RECOVERY_COOLDOWN LOCK_BUSY "
+      reasons=" manual worker_missing no_tcp resource_high WORKER_CHANGED_AFTER_LIMIT WORKER_CHANGED SDK_NOT_ENABLED SERVICE_NOT_RUNNING WORKER_IDENTIFICATION_FAILED BIRTH_PROBE_FAILED STATS_FAILED NO_SUSTAINED_TCP "
+      failures=" worker_identity worker_missing worker_stat supervisor_stat cgroup_v2 cgroup_path dedicated_cgroup shared_pid1 cgroup_mount unrelated_members nft_permission nft_read cgroup_changed probe_must_run_outside probe_low_headroom kernel_probe probe_send probe_read cgroup_match_ambiguous outside_probe_send cgroup_match_not_exclusive probe_cleanup nft_check nft_apply cache_write "
+    }
+    NR==1 {
+      event=$1
+      if(event=="LIMIT_OK" || event=="CGROUP_MATCH_VERIFIED")exit
+      if(index(events," " event " ")==0)event="UNCLASSIFIED_EVENT"
+      s=event
+      for(i=2;i<=NF;i++) {
+        field=$i; key=field;sub(/=.*/,"",key);value=substr(field,length(key)+2)
+        if(key ~ /^(pid|udp|fd|tcp|estab|rss|flows|samples|limit|level)$/ && value ~ /^[0-9]+$/ && length(value)<=10){s=s " " field;continue}
+        if(key=="count" && value ~ /^[0-9]+\/[0-9]+$/ && length(value)<=21){s=s " " field;continue}
+        if(key=="span" && value ~ /^[0-9]+s$/ && length(value)<=11){s=s " " field;continue}
+        if(key=="reason" && index(reasons," " value " ")>0){s=s " " field;continue}
+        if(field=="service=running" || field=="stats=readable"){s=s " " field;continue}
+        if(event=="LIMIT_UNAVAILABLE" && index(failures," " field " ")>0){s=s " " field;continue}
+        redacted=1
+      }
+      if(redacted)s=s " [DETAIL_REDACTED]"
+      print substr(s,1,1024)
+    }'
+}
+log_plain_path() (
+  case "$1" in /var/log/xray-runtime.log|/var/log/xray-runtime.log.1) :;; *) exit 1;; esac
+  lp=$1
+  while [ "$lp" != / ]; do
+    [ ! -L "$lp" ] || exit 1
+    lp=${lp%/*}; [ -n "$lp" ] || lp=/
+  done
+  [ -d "${1%/*}" ] && [ "$(stat -c %u "${1%/*}")" = 0 ] || exit 1
+  pm=$(stat -c %a "${1%/*}") || exit 1
+  case "$pm" in ''|*[!0-7]*) exit 1;; esac
+  [ "$((0$pm & 022))" = 0 ] || exit 1
+  if [ -e "$1" ]; then
+    [ -f "$1" ] && [ "$(stat -c %u:%h "$1")" = 0:1 ] || exit 1
+    fm=$(stat -c %a "$1") || exit 1
+    case "$fm" in ''|*[!0-7]*) exit 1;; esac
+    [ "$((0$fm & 022))" = 0 ] || exit 1
+  fi
+)
+log() (
+  message=$(log_message "$*") || exit 1
+  [ -n "$message" ] || exit 0
+  line="$(date '+%F %T') APPLICATION=EarnApp $message"
+  log_refused() { printf '%s\n' "$line" 'APPLICATION=EarnApp LOG_WRITE_REFUSED unsafe_or_unavailable_application_log' >&2; exit 1; }
+  [ "$LOG" = /var/log/xray-runtime.log ] && [ "$(id -u)" = 0 ] || log_refused
+  log_plain_path "$LOG" && log_plain_path "$LOG.1" || log_refused
+  umask 077
+  # Opening with append does not truncate an existing log. Check the opened
+  # descriptor too, before acquiring its inode lock and before any writes.
+  exec 4>>"$LOG" || log_refused
+  [ "$(stat -Lc %u:%h /proc/self/fd/4)" = 0:1 ] || log_refused
+  flock -n 4 || log_refused
+  log_plain_path "$LOG" && log_plain_path "$LOG.1" || log_refused
+  [ "$(stat -Lc %d:%i /proc/self/fd/4)" = "$(stat -c %d:%i "$LOG")" ] || log_refused
+  size=$(stat -c %s "$LOG") || log_refused
+  case "$size" in ''|*[!0-9]*) log_refused;; esac
+  bytes=$(printf '%s\n' "$line" | wc -c) || log_refused
+  if [ "$size" -gt "$((262144-bytes))" ]; then
+    # This is ordinary size rotation of this application's exact log only.
+    tail -c 262144 "$LOG" >"$LOG.1" && : >"$LOG" || log_refused
+  fi
+  printf '%s\n' "$line" >&4 || log_refused
+  printf '%s\n' "$line" >&2
+)
+KR_OPERATION_LOGGER
+}
 
 # Refuse symlinks in every existing component, including the requested leaf.
 kr_plain_path() (
@@ -2858,9 +2987,9 @@ kr_emit_config() (
 kr_emit_init() {
   cat <<'KR_OPENRC_INIT'
 #!/sbin/openrc-run
-# XRAY-RUNTIME-MAINTENANCE-2026.10.19.2; private EarnApp SDK runtime.
+# XRAY-RUNTIME-MAINTENANCE-2026.10.19.3; private EarnApp SDK runtime.
 name="xray-runtime"
-description="Private application runtime"
+description="EarnApp SDK runtime with custom service name"
 command="/opt/xray-runtime/xray"
 command_args="run"
 command_user="root"
@@ -2888,7 +3017,7 @@ kr_stage_helpers() (
     kr_file=$kr_dir/$kr_name
     [ -f "$kr_file" ] && [ ! -L "$kr_file" ] || exit 1
     sed \
-      -e 's/EARNAPP-MAINTENANCE-2026\.10\.18\.2/XRAY-RUNTIME-MAINTENANCE-2026.10.19.2/g' \
+      -e 's/EARNAPP-MAINTENANCE-2026\.10\.18\.2/XRAY-RUNTIME-MAINTENANCE-2026.10.19.3/g' \
       -e 's|/etc/earnapp/maintenance\.conf|/etc/xray-runtime/maintenance.conf|g' \
       -e 's/earnapp-maintenance-v5/xray-runtime-v6/g' \
       -e 's/earnapp-maintenance/xray-runtime/g' \
@@ -2914,6 +3043,11 @@ kr_stage_helpers() (
     {print}
   ' "$kr_dir/common" >"$kr_dir/common.next" || exit 1
   mv "$kr_dir/common.next" "$kr_dir/common" || exit 1
+  # Replace only this runtime's generated maintenance logger; the preserved
+  # legacy module and other applications retain their own logging behavior.
+  awk '!/^log\(\) \{/' "$kr_dir/common" >"$kr_dir/common.next" || exit 1
+  kr_emit_operation_logger >>"$kr_dir/common.next" || exit 1
+  mv "$kr_dir/common.next" "$kr_dir/common" || exit 1
   for kr_name in common watchdog recover limit boot; do sh -n "$kr_dir/$kr_name" || exit 1; done
   chmod 644 "$kr_dir/common" && chmod 755 "$kr_dir/watchdog" "$kr_dir/recover" "$kr_dir/limit" "$kr_dir/boot"
 )
@@ -2928,8 +3062,12 @@ kr_elf_uint() (
 )
 
 kr_sdk_elf_valid() (
+  [ "$#" = 1 ] || exit 1
   kr_sdk_file=$1
-  [ "$(hash_file "$kr_sdk_file")" = "$KR_SDK_SHA" ] || { kr_error 'unknown SDK bytes; refusing interpreter patch'; exit 1; }
+  kr_source_hash=$(hash_file "$kr_sdk_file") || exit 1
+  kr_sdk_source_hash_valid "$kr_source_hash" && kr_select_sdk_profile "$kr_source_hash" || {
+    kr_error 'unknown SDK bytes; refusing interpreter patch'; exit 1;
+  }
   [ "$(od -An -v -tx1 -N 6 "$kr_sdk_file" | tr -d ' \n')" = 7f454c460201 ] || exit 1
   [ "$(kr_elf_uint "$kr_sdk_file" 18 2)" = 62 ] || exit 1
   kr_phoff=$(kr_elf_uint "$kr_sdk_file" 32 8) || exit 1
@@ -2942,14 +3080,14 @@ kr_sdk_elf_valid() (
     kr_p=$((kr_phoff + kr_i * kr_phsize))
     kr_type=$(kr_elf_uint "$kr_sdk_file" "$kr_p" 4) || exit 1
     if [ "$kr_type" = 3 ]; then
-      [ "$(kr_elf_uint "$kr_sdk_file" "$((kr_p + 8))" 8)" = 792 ] || exit 1
-      [ "$(kr_elf_uint "$kr_sdk_file" "$((kr_p + 32))" 8)" = 28 ] || exit 1
+      [ "$(kr_elf_uint "$kr_sdk_file" "$((kr_p + 8))" 8)" = "$KR_PROFILE_INTERP_OFFSET" ] || exit 1
+      [ "$(kr_elf_uint "$kr_sdk_file" "$((kr_p + 32))" 8)" = "$KR_PROFILE_INTERP_SIZE" ] || exit 1
       kr_interps=$((kr_interps + 1))
     fi
     kr_i=$((kr_i + 1))
   done
   [ "$kr_interps" = 1 ] || exit 1
-  [ "$(od -An -v -tx1 -j 792 -N 28 "$kr_sdk_file" | tr -d ' \n')" = 2f6c696236342f6c642d6c696e75782d7838362d36342e736f2e3200 ] || exit 1
+  [ "$(od -An -v -tx1 -j "$KR_PROFILE_INTERP_OFFSET" -N "$KR_PROFILE_INTERP_SIZE" "$kr_sdk_file" | tr -d ' \n')" = 2f6c696236342f6c642d6c696e75782d7838362d36342e736f2e3200 ] || exit 1
 )
 
 kr_fetch_deb() (
@@ -2963,7 +3101,9 @@ kr_fetch_deb() (
     kr_download=$(mktemp "$kr_cache/.download.XXXXXX") || exit 1
     trap 'rm -f "$kr_download"' EXIT
     trap 'exit 1' HUP INT TERM
-    curl --proto '=https' --tlsv1.2 -fL --connect-timeout 15 --max-time 180 "$kr_url" -o "$kr_download" || exit 1
+    curl -q --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 -fL \
+      --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 1 --retry-max-time 60 \
+      --retry-all-errors "$kr_url" -o "$kr_download" || exit 1
     [ "$(hash_file "$kr_download")" = "$kr_sha" ] || { kr_error "download package hash mismatch: $kr_name"; exit 1; }
     chmod 644 "$kr_download" && mv "$kr_download" "$kr_path" || exit 1
   fi
@@ -2997,10 +3137,39 @@ kr_copy_private_lib() (
   cp -L "$kr_src" "$kr_dest/$kr_name" && chmod 755 "$kr_dest/$kr_name"
 )
 
+# The SSL3 SDK can dlopen these libraries, so the main executable --list alone
+# cannot prove their dependency closure. Inspect both with the private loader.
+kr_private_ssl_closure() (
+  [ "$#" = 3 ] || exit 1
+  kr_ssl_rt=$1; kr_ssl_name=$2; kr_ssl_need=$3
+  kr_ssl_listing=$(env LD_LIBRARY_PATH="$kr_ssl_rt/lib" "$kr_ssl_rt/ld.so" --library-path "$kr_ssl_rt/lib" --list "$kr_ssl_rt/lib/$kr_ssl_name" 2>&1) || {
+    kr_error 'private SSL dependency resolver failed'; exit 1;
+  }
+  printf '%s\n' "$kr_ssl_listing" | awk -v root="$kr_ssl_rt" -v required="$kr_ssl_need" '
+    /^[[:space:]]*linux-vdso\.so\.[0-9]+[[:space:]]+\(0x[0-9a-f]+\)$/ {vdso++;next}
+    $2=="=>" && $3==root "/lib/" $1 && NF==4 && $4~/^\(0x[0-9a-f]+\)$/ {
+      if($1 !~ /^(libcrypto\.so\.3|libc\.so\.6|libdl\.so\.2|libpthread\.so\.0)$/)bad=1
+      seen[$1]++;next
+    }
+    ($1=="/opt/xray-runtime/ld.so" || $1==root "/ld.so") && NF==2 && $2~/^\(0x[0-9a-f]+\)$/ {loader++;next}
+    ($1=="/opt/xray-runtime/ld.so" || $1=="/lib64/ld-linux-x86-64.so.2" || $1==root "/ld.so") && $2=="=>" && $3==root "/ld.so" && NF==4 && $4~/^\(0x[0-9a-f]+\)$/ {loader++;next}
+    {bad=1}
+    END {
+      n=split(required,need," ")
+      for(i=1;i<=n;i++)if(seen[need[i]]!=1)bad=1
+      for(name in seen)if(seen[name]!=1)bad=1
+      exit bad || vdso!=1 || loader!=1
+    }' || { kr_error 'SSL dependency closure escaped the private runtime'; exit 1; }
+)
+
 kr_private_closure() (
   kr_rt=$1
   kr_plain_path "$kr_rt" || exit 1
-  kr_listing=$(env LD_LIBRARY_PATH="$kr_rt/lib" "$kr_rt/ld.so" --library-path "$kr_rt/lib" --list "$kr_rt/xray" 2>&1) || { printf '%s\n' "$kr_listing" >&2; exit 1; }
+  kr_closure_hash=$(hash_file "$kr_rt/xray") || exit 1
+  kr_patched_hash_valid "$kr_closure_hash" && kr_select_sdk_profile "$kr_closure_hash" || exit 1
+  kr_listing=$(env LD_LIBRARY_PATH="$kr_rt/lib" "$kr_rt/ld.so" --library-path "$kr_rt/lib" --list "$kr_rt/xray" 2>&1) || {
+    kr_error 'private SDK dependency resolver failed'; exit 1;
+  }
   printf '%s\n' "$kr_listing" | awk -v root="$kr_rt" '
     /^[[:space:]]*linux-vdso\.so\.[0-9]+[[:space:]]+\(0x[0-9a-f]+\)$/ {vdso++;next}
     $2=="=>" && $3==root "/lib/" $1 && NF==4 && $4~/^\(0x[0-9a-f]+\)$/ {seen[$1]++;next}
@@ -3013,6 +3182,10 @@ kr_private_closure() (
       for(i=1;i<=n;i++)if(seen[need[i]]!=1)bad=1
       exit bad || vdso!=1 || loader!=1
     }' || { kr_error 'dependency closure did not resolve entirely inside the private runtime'; exit 1; }
+  if [ "$KR_PROFILE_NEEDS_SSL" = 1 ]; then
+    kr_private_ssl_closure "$kr_rt" libcrypto.so.3 libc.so.6 &&
+      kr_private_ssl_closure "$kr_rt" libssl.so.3 'libcrypto.so.3 libc.so.6' || exit 1
+  fi
 )
 
 # The pkg SDK reads /proc/self/exe. Explicit loader execution is valid for --list,
@@ -3021,8 +3194,10 @@ kr_private_closure() (
 kr_runtime_live_valid() (
   [ "$#" = 1 ] && [ "$1" = "$KR_HOME" ] || exit 1
   kr_rt=$1
+  kr_live_hash=$(hash_file "$kr_rt/xray") || exit 1
+  kr_patched_hash_valid "$kr_live_hash" && kr_select_sdk_profile "$kr_live_hash" || exit 1
   kr_runtime_fingerprint "$kr_rt" >/dev/null || exit 1
-  [ "$(hash_file "$kr_rt/xray")" = "$KR_PATCHED_SHA" ] || exit 1
+  [ "$kr_live_hash" = "$KR_PROFILE_PATCHED_SHA" ] || exit 1
   kr_private_closure "$kr_rt" || exit 1
   kr_version=$(timeout -k 2 20 env LD_LIBRARY_PATH="$kr_rt/lib" "$kr_rt/xray" --version 2>&1) || {
     kr_error 'direct SDK version execution failed'; exit 1;
@@ -3039,6 +3214,8 @@ kr_stage_runtime() (
   kr_platform_supported || exit 1
   kr_plain_path "$kr_rt" && kr_plain_path "$kr_original" && kr_plain_path "$kr_cache" || exit 1
   [ -f "$kr_original" ] && [ -r "$kr_original" ] || exit 1
+  kr_original_hash=$(hash_file "$kr_original") || exit 1
+  kr_sdk_source_hash_valid "$kr_original_hash" && kr_select_sdk_profile "$kr_original_hash" || exit 1
   kr_sdk_elf_valid "$kr_original" || exit 1
   [ ! -e "$kr_rt" ] || { [ -d "$kr_rt" ] && [ -z "$(ls -A "$kr_rt")" ]; } || exit 1
   for kr_tool in ar tar xz od dd sha256sum timeout; do need "$kr_tool" || exit 1; done
@@ -3053,6 +3230,13 @@ kr_stage_runtime() (
   kr_extract_deb "$kr_deb" "$kr_work/root" "$kr_work" || exit 1
   kr_deb=$(kr_fetch_deb "$kr_cache" libstdc++6_12.2.0-14+deb12u1_amd64.deb https://deb.debian.org/debian/pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_amd64.deb 5cd3171216d4ab0fc911cfe9c35509bf2dd8f47761c43b7f6a4296701551a24d) || exit 1
   kr_extract_deb "$kr_deb" "$kr_work/root" "$kr_work" || exit 1
+  if [ "$KR_PROFILE_NEEDS_SSL" = 1 ]; then
+    kr_deb=$(kr_fetch_deb "$kr_cache" libssl3_3.0.20-1~deb12u2_amd64.deb https://deb.debian.org/debian/pool/main/o/openssl/libssl3_3.0.20-1~deb12u2_amd64.deb 89be24b41bff568ee6e7caf5680a3d808e80315ed92e407056ce0fa7a5bda025) || exit 1
+    kr_extract_deb "$kr_deb" "$kr_work/root" "$kr_work" || exit 1
+    for kr_lib in libssl.so.3 libcrypto.so.3; do
+      kr_copy_private_lib "$kr_work/root" "$kr_rt/lib" "$kr_lib" || exit 1
+    done
+  fi
   for kr_lib in libdl.so.2 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libpthread.so.0 libc.so.6 ld-linux-x86-64.so.2; do
     kr_copy_private_lib "$kr_work/root" "$kr_rt/lib" "$kr_lib" || exit 1
   done
@@ -3064,10 +3248,10 @@ kr_stage_runtime() (
   cp "$kr_rt/lib/ld-linux-x86-64.so.2" "$kr_rt/ld.so" && cp "$kr_original" "$kr_rt/xray" || exit 1
   # 23 path bytes and five NULs fill the original, verified 28-byte PT_INTERP.
   printf '/opt/xray-runtime/ld.so\000\000\000\000\000' >"$kr_work/interp" || exit 1
-  [ "$(wc -c <"$kr_work/interp" | tr -d ' ')" = 28 ] || exit 1
-  dd if="$kr_work/interp" of="$kr_rt/xray" bs=1 seek=792 conv=notrunc 2>/dev/null || exit 1
+  [ "$(wc -c <"$kr_work/interp" | tr -d ' ')" = "$KR_PROFILE_INTERP_SIZE" ] || exit 1
+  dd if="$kr_work/interp" of="$kr_rt/xray" bs=1 seek="$KR_PROFILE_INTERP_OFFSET" conv=notrunc 2>/dev/null || exit 1
   chmod 755 "$kr_rt/xray" "$kr_rt/ld.so" || exit 1
-  [ "$(hash_file "$kr_original")" = "$KR_SDK_SHA" ] && [ "$(hash_file "$kr_rt/xray")" = "$KR_PATCHED_SHA" ] || exit 1
+  [ "$(hash_file "$kr_original")" = "$kr_original_hash" ] && [ "$(hash_file "$kr_rt/xray")" = "$KR_PROFILE_PATCHED_SHA" ] || exit 1
   kr_private_closure "$kr_rt" || exit 1
   kr_runtime_fingerprint "$kr_rt" >/dev/null || exit 1
 )
@@ -3076,6 +3260,12 @@ kr_runtime_fingerprint() (
   [ "$#" = 1 ] && kr_plain_path "$1" || exit 1
   kr_rt=$1
   [ -d "$kr_rt/lib" ] && [ ! -L "$kr_rt/lib" ] || exit 1
+  kr_fingerprint_ssl=0
+  kr_fingerprint_sdk=$(hash_file "$kr_rt/xray") || exit 1
+  if kr_patched_hash_valid "$kr_fingerprint_sdk"; then
+    kr_select_sdk_profile "$kr_fingerprint_sdk" || exit 1
+    kr_fingerprint_ssl=$KR_PROFILE_NEEDS_SSL
+  fi
   LC_ALL=C; export LC_ALL
   # Names and contents are both covered; ordinary files only, no hidden entries.
   for kr_entry in "$kr_rt"/* "$kr_rt"/.[!.]* "$kr_rt"/..?*; do
@@ -3089,19 +3279,1517 @@ kr_runtime_fingerprint() (
     kr_rel=${kr_file#"$kr_rt"/}
     case "$kr_rel" in
       ld.so|xray|lib/ld-linux-x86-64.so.2|lib/libdl.so.2|lib/libstdc++.so.6|lib/libm.so.6|lib/libgcc_s.so.1|lib/libpthread.so.0|lib/libc.so.6|lib/libnss_dns.so.2|lib/libnss_files.so.2|lib/libresolv.so.2) :;;
+      lib/libssl.so.3|lib/libcrypto.so.3) [ "$kr_fingerprint_ssl" = 1 ] || exit 1;;
       *) exit 1;;
     esac
     kr_digest=$(hash_file "$kr_file") || exit 1
     kr_manifest=$kr_manifest$kr_digest'  '$kr_rel'
 '
   done
+  if [ "$kr_fingerprint_ssl" = 1 ]; then
+    [ -f "$kr_rt/lib/libssl.so.3" ] && [ -f "$kr_rt/lib/libcrypto.so.3" ] || exit 1
+  fi
   [ -f "$kr_rt/xray" ] && [ -f "$kr_rt/ld.so" ] && [ -n "$kr_manifest" ] || exit 1
   printf '%s' "$kr_manifest" | sha256sum | awk '{print $1}'
 )
 
+# Narrow compatibility for individually reviewed historical EarnApp state.
+# Existing suite_legacy_hash/suite_table_owned stay the primary ownership checks.
+kr_legacy_known_helper(){
+  # 2026-10-19 fixed-path source collection: first group received byte-identically
+  # and reviewed. Recognition does not execute watchdog/recovery bodies or waive
+  # source/cron guards; restored limiter execution has its own exact contract.
+  case "$1:$2" in
+    old-common:7ad356a34a78c1bb8aa427bd9b7865d03b07b15999f101333bf177f8789e994f|\
+    old-watchdog:ef34020fb854b861b546ed865729582d69efcf236bbe91964a910e341017f90a|\
+    old-recover:3c4f6be23a5cfd36be5802d4f73fe3d0b2dee206afcb600b84e0230d953cc87a|\
+    old-limit:c826e7942fa3dc70e1481090437117442b72ff401c166a8f4ef0890114ede2d8|\
+    old-watchdog:6172898c75a8493d678bc5bc6fd9ad1154eec398e8a27accf0a131feae8ca679|\
+    old-recover:14dc8366b1ef32a090758c025eb3dce6c138097c9e5299b225ad8d7a0a2d232a|\
+    old-watchdog:b63c952db017fcf331694566fda9bcedbeaa471830250d49b3d08602f6edef77|\
+    old-watchdog:1c1eb5c501079b0b9a049f2be7525854c661a50688cdcb933f237ad5a855ff0a|\
+    old-limit:e395f5e9c92a5aa6a62e3ae0fbe239d46792d35933724e4dddb7d71f2c749b02|\
+    old-watchdog:fc0a3e2ddc0ddb38875b67085c30585224359844563f212678b779578e74c4c1|\
+    old-recover:fb12125dd74cb36c506183de111656167a2cbc152d17faaf961e3bd4beabc554|\
+    old-limit:35190e2525739fda3a28d1a26fa4a5c4f79a1830e23930ab8a300e4201a5f31e|\
+    old-watchdog:a6e0f2087d21a8f01f126b1cef1601ce36f0806e58c4a8a15cb169900a43c848|\
+    old-recover:aa5635bb664307db336b81d731c1e42aa4ceb6b0e271f65765e4dbbbe0db900d|\
+    old-limit:d040fb5742aa676cdf9dcf98f2e9ab76c3c4121b1a89fb1a27e22852360ad20c|\
+    old-boot:802bf196c51792e65f88b883065162d2a49d89da6f7bdc307af3e7a22f5493ce|\
+    old-limit:92f8fd0f71d96700bbf62e873fb2533cc7ae4e1c73c57956c70faa6ccc96580a|\
+    old-boot:adb32032c1c0d098b2c69597a7a883dadcc581f3d0dda54a17f5cdb092fcd3cf) return 0;;
+    # Original hashes of five fully reviewed CA1/TW5 helpers. The controlled
+    # collector checked stable SHA/metadata before and after reading. Each body
+    # differs only by one 41-byte SDK identity replaced with a 20-byte marker:
+    # exact size delta21, one device marker, no other redaction markers. Identity
+    # literals stay private; neither arbitrary sanitized hashes nor patterns pass.
+    old-watchdog:008f259f5cb61ed629e44c2f3ca93ff092ed0518ff7df33ffb6ef40386657807|\
+    old-limit:c677d1fdc66dda5d6d57d657ff23bd4ab39692ef1222286217c01fdbe84c24de|\
+    old-watchdog:c534e8d02a083bab12b9ec63da07412ab7d9770857ce7d2006e73d77181decf0|\
+    old-recover:c8188c26855eeb3aaaa5123724e371dabb626f9ff938fa7db1a99c69c33295a7|\
+    old-limit:b931f72c925792d1817b0007dbe8c71d92a46956445380fa079cc1e2c0ba3cc5) return 0;;
+    *) return 1;;
+  esac
+}
+kr_legacy_gcompat_root_file(){
+  [ "$#" = 1 ] && valid_path "$1" && [ -f "$1" ] && [ -r "$1" ] || return 1
+  KGF_PATH=$1
+  while :; do
+    [ ! -L "$KGF_PATH" ] && [ "$(stat -c %u "$KGF_PATH")" = 0 ] || return 1
+    KGF_MODE=$(stat -c %a "$KGF_PATH") || return 1
+    case "$KGF_MODE" in ''|*[!0-7]*) return 1;; esac
+    [ "$((0$KGF_MODE & 022))" = 0 ] || return 1
+    [ "$KGF_PATH" != / ] || return 0
+    KGF_PATH=${KGF_PATH%/*}; [ -n "$KGF_PATH" ] || KGF_PATH=/
+  done
+}
+kr_legacy_gcompat_run_argv() (
+  # Only the exact eight-token JP2 gcompat form observed on 2026-10-19 is
+  # admitted. All caller birth/supervisor/maps/root/extra-worker guards remain.
+  [ "$#" = 3 ] || exit 1
+  KGA_PROC=$1; KGA_SDK=$2; KGA_CANON=$3
+  valid_path "$KGA_PROC" && valid_path "$KGA_CANON" || exit 1
+  case "$KGA_SDK" in /usr/bin/earnapp|/usr/local/lib/vesari) :;; *) exit 1;; esac
+  [ "$(readlink -f "$KGA_SDK")" = "$KGA_CANON" ] &&
+    kr_legacy_gcompat_root_file "$KGA_SDK" || exit 1
+  KGA_SDK_HASH=$(hash_file "$KGA_SDK") && kr_sdk_source_hash_valid "$KGA_SDK_HASH" || exit 1
+  KGA_LOADER=/lib/ld-musl-x86_64.so.1
+  KGA_PRELOAD=/lib/libgcompat.so.0
+  kr_legacy_gcompat_root_file "$KGA_LOADER" && [ -x "$KGA_LOADER" ] &&
+    kr_legacy_gcompat_root_file "$KGA_PRELOAD" || exit 1
+  # This also works on ku_argv temporary cmdline/exe nodes: the caller has
+  # already checked the actual worker mapping and process incarnation.
+  [ "$(readlink "$KGA_PROC/exe")" = "$KGA_LOADER" ] || exit 1
+  KGA_LOADER_HASH=$(hash_file "$KGA_LOADER") && KGA_PRELOAD_HASH=$(hash_file "$KGA_PRELOAD") || exit 1
+  [ "$(hash_file "$KGA_PROC/exe")" = "$KGA_LOADER_HASH" ] || exit 1
+  KGA_CMD_HASH=$(hash_file "$KGA_PROC/cmdline") || exit 1
+  KGA_NULS=$(tr -cd '\000' < "$KGA_PROC/cmdline" | wc -c | tr -d ' ') || exit 1
+  [ "$KGA_NULS" = 8 ] || exit 1
+  tr '\000' '\n' < "$KGA_PROC/cmdline" | LC_ALL=C awk -v sdk="$KGA_SDK" -v canonical="$KGA_CANON" -v preload="$KGA_PRELOAD " '
+    NR==1{if($0!="ld-linux-x86-64.so.2")bad=1;next}
+    NR==2{if($0!="--argv0")bad=1;next}
+    NR==3{if($0!=sdk && $0!=canonical)bad=1;program=$0;next}
+    NR==4{if($0!="--preload")bad=1;next}
+    NR==5{if($0!=preload)bad=1;next}
+    NR==6{if($0!="--")bad=1;next}
+    NR==7{if($0!=program)bad=1;next}
+    NR==8{if($0!="run")bad=1;next}
+    {bad=1}
+    END{exit bad || NR!=8}' || exit 1
+  [ "$(hash_file "$KGA_PROC/cmdline")" = "$KGA_CMD_HASH" ] &&
+    [ "$(readlink "$KGA_PROC/exe")" = "$KGA_LOADER" ] &&
+    [ "$(hash_file "$KGA_PROC/exe")" = "$KGA_LOADER_HASH" ] &&
+    [ "$(hash_file "$KGA_LOADER")" = "$KGA_LOADER_HASH" ] &&
+    [ "$(hash_file "$KGA_PRELOAD")" = "$KGA_PRELOAD_HASH" ] &&
+    [ "$(hash_file "$KGA_SDK")" = "$KGA_SDK_HASH" ] &&
+    kr_legacy_gcompat_root_file "$KGA_SDK" && kr_legacy_gcompat_root_file "$KGA_LOADER" &&
+    kr_legacy_gcompat_root_file "$KGA_PRELOAD"
+)
+suite_source_run_argv() (
+  [ "$#" = 1 ] || exit 1
+  suite_source_absolute_run_argv "$1" && exit 0
+  kr_legacy_gcompat_run_argv "$1" "$SDK_BIN" "$NSP_CANON"
+)
+suite_updater_run_argv() (
+  [ "$#" = 1 ] || exit 1
+  suite_updater_absolute_run_argv "$1" && exit 0
+  kr_legacy_gcompat_run_argv "$1" "$NUG_SDK" "$NUG_CANON"
+)
+kr_legacy_limit_contract(){
+  # Dispatch is by the reviewed file bytes, never node name or input flags.
+  case "$1" in
+    1582c02ebe633d0bf98a468a1ea5fa8b5bf6bc6d4adcc4cf1ebfb1b6cf4a75c5|\
+    35190e2525739fda3a28d1a26fa4a5c4f79a1830e23930ab8a300e4201a5f31e|\
+    d040fb5742aa676cdf9dcf98f2e9ab76c3c4121b1a89fb1a27e22852360ad20c|\
+    92f8fd0f71d96700bbf62e873fb2533cc7ae4e1c73c57956c70faa6ccc96580a)
+      printf '%s\n' 'simple /run/earnapp-watchdog.lockfile';;
+    dd738eb46331a49230b7977fca80183e7858ef829ad844ac550faeb3a3e38485|\
+    971f4288ed4bc4757ffb9ccba3b91e0bcfc7ad8b9b46f050fe99871efca9e3e6|\
+    c826e7942fa3dc70e1481090437117442b72ff401c166a8f4ef0890114ede2d8|\
+    4bd38f49d05190014e819fa9ba99f2ca2e8eabcae02828f4729cd3598a03c5f3|\
+    c3a57e9b5c3333b015793b71117dce0848335c041ddeb36f5411fc5afb87afd5|\
+    7d73699a7d93cd4620c877b89c863fecafae930f8426c5964347993f45fa8e7b|\
+    e395f5e9c92a5aa6a62e3ae0fbe239d46792d35933724e4dddb7d71f2c749b02)
+      printf '%s\n' 'locked /run/earnapp-watchdog.lockfile';;
+    c677d1fdc66dda5d6d57d657ff23bd4ab39692ef1222286217c01fdbe84c24de)
+      printf '%s\n' 'locked /run/earnapp-ca1-maintenance.lockfile';;
+    b931f72c925792d1817b0007dbe8c71d92a46956445380fa079cc1e2c0ba3cc5)
+      printf '%s\n' 'locked /run/earnapp-tw5-guard.lockfile';;
+    *) return 1;;
+  esac
+}
+kr_legacy_worker_lock(){
+  # Live helper paths can already be paused or removed. The sealed snapshot is
+  # the authority for the mutex selected before and during restoration.
+  KLL_OLD=$(kr_expected /usr/local/sbin/earnapp-limit "$KE_B/sealed/snapshot.manifest") || return 1
+  if [ "$KLL_OLD" = '- -' ]; then printf '%s\n' /run/earnapp-watchdog.lockfile; return 0; fi
+  [ "$(kr_fingerprint "$KE_B/sealed/files/usr/local/sbin/earnapp-limit")" = "$KLL_OLD" ] || return 1
+  KLL_CONTRACT=$(kr_legacy_limit_contract "${KLL_OLD%% *}") || return 1
+  printf '%s\n' "${KLL_CONTRACT#* }"
+}
+kr_legacy_restore_limit(){
+  KRL_OLD=$(kr_expected /usr/local/sbin/earnapp-limit "$KE_B/sealed/snapshot.manifest") || return 1
+  [ "$KRL_OLD" != '- -' ] || return 1
+  [ "$(kr_fingerprint /usr/local/sbin/earnapp-limit)" = "$KRL_OLD" ] || return 1
+  KRL_CONTRACT=$(kr_legacy_limit_contract "${KRL_OLD%% *}") || return 1
+  KRL_LOCK=${KRL_CONTRACT#* }
+  [ "$(kr_legacy_worker_lock)" = "$KRL_LOCK" ] || return 1
+  case "${KRL_CONTRACT%% *}" in
+    simple)
+      # These historical scripts use argv[1] as the limit and have no lease API.
+      timeout -k 5 60 /usr/local/sbin/earnapp-limit 20 5>&- 6>&- 7>&- 8>&- 9>&-;;
+    locked)
+      kr_opened_lock "$KRL_LOCK" 7 || return 1
+      [ "$(kr_fingerprint /usr/local/sbin/earnapp-limit)" = "$KRL_OLD" ] || return 1
+      timeout -k 5 60 /usr/local/sbin/earnapp-limit --locked 20 9>&7 5>&- 6>&- 7>&- 8>&-;;
+    *) return 1;;
+  esac
+}
+kr_legacy_table_owned(){
+  # Only this original service/table pair has observed legacy variants.
+  [ "$1:$2" = earnapp_limit:earnapp ] || return 1
+  KLT_TEXT=$(nft list table inet earnapp_limit) || return 1
+  printf '%s\n' "$KLT_TEXT" | LC_ALL=C awk '
+  function uint64(s){
+    return (s=="0" || s ~ /^[1-9][0-9]*$/) &&
+      (length(s)<20 || (length(s)==20 && ("u:" s)<=("u:18446744073709551615")))
+  }
+  function positive(s){return uint64(s) && s!="0"}
+  function tag_note(s,level,operand, n,a){
+    if(s !~ /^"[^" ]+"$/)return 0
+    s=substr(s,2,length(s)-2);n=split(s,a,":")
+    if(operand!="" && ("i:" a[2])!=("i:" operand))return 0
+    if(n==3 && a[1]=="earnapp-v2" && positive(a[2]) && a[3]=="20")return 1
+    if(n==4 && (a[1]=="earnapp-v3" || a[1]=="earnapp-v4") && positive(a[2]) && ("l:" a[3])==("l:" level) && a[4]=="20")return 1
+    return 0
+  }
+  function inode_note(s, n,a){
+    if(s !~ /^"EarnApp inode [1-9][0-9]* cap 20"$/)return ""
+    n=split(s,a," ");return n==5 && positive(a[3]) ? a[3] : ""
+  }
+  function counts(s, n,a,p){
+    note="";p=index(s," comment ")
+    if(p){note=substr(s,p+9);s=substr(s,1,p-1)}
+    n=split(s,a," ")
+    return n==6 && a[1]=="counter" && a[2]=="packets" && uint64(a[3]) && a[4]=="bytes" && uint64(a[5]) && a[6]=="reject"
+  }
+  function rule(s, n,a,p){
+    n=split(s,a," ")
+    if(n<6 || a[1]!="socket" || a[2]!="cgroupv2" || a[3]!="level" ||
+       (a[4]!="1" && a[4]!="2"))return 0
+    # Once a stopped source cgroup disappears nft prints its numeric inode.
+    # Permit only the same known policy, with exact inode/tag and pair binding.
+    operand=""
+    if(a[5]!="\"openrc.earnapp\""){
+      if(!positive(a[5]))return 0
+      operand=a[5]
+    }
+    level=a[4];tail=s
+    sub(/^socket cgroupv2 level [^ ]+ [^ ]+ /,"",tail)
+    return 1
+  }
+  function first(s, p,t){
+    if(!rule(s))return 0
+    p="meta l4proto { tcp, udp } ct state new ct count over 20 "
+    if(index(tail,p)==1){
+      t=substr(tail,length(p)+1)
+      if(!counts(t) || !tag_note(note,level,operand))return 0
+      step=5;return 1
+    }
+    marked_level=level;marked_operand=operand;marked_proto=0;marked_note="";marked_inode=""
+    p="meta l4proto { tcp, udp } "
+    if(index(tail,p)==1){marked_proto=1;tail=substr(tail,length(p)+1)}
+    p="ct state new ct mark set 0x000eaa20"
+    if(tail==p){step=4;return 1}
+    if(marked_proto || index(tail,p " comment ")!=1)return 0
+    marked_note=substr(tail,length(p)+10);marked_inode=inode_note(marked_note)
+    if(marked_inode=="")return 0
+    if(operand!="" && ("i:" marked_inode)!=("i:" operand))return 0
+    step=4;return 1
+  }
+  function second(s, p,t){
+    if(!rule(s) || level!=marked_level || ("i:" operand)!=("i:" marked_operand))return 0
+    p=marked_proto ? "meta l4proto { tcp, udp } " : ""
+    p=p "ct state new ct mark 0x000eaa20 ct count over 20 "
+    if(index(tail,p)!=1 || !counts(substr(tail,length(p)+1)))return 0
+    if(marked_proto){
+      if(note !~ /^"earnapp-v4:/ || !tag_note(note,level,operand))return 0
+    }else if(marked_inode!=""){
+      if(note!=marked_note || inode_note(note)!=marked_inode)return 0
+    }else if(note!="")return 0
+    step=5;return 1
+  }
+  {
+    s=$0;sub(/^[[:space:]]+/,"",s);sub(/[[:space:]]+$/,"",s)
+    if(s=="")next
+    # Preserve quoted comment bytes while tolerating nft indentation/spacing.
+    p=index(s," comment ");suffix=""
+    if(p){suffix=substr(s,p);s=substr(s,1,p-1)}
+    gsub(/[[:space:]]+/," ",s);s=s suffix
+    if(step==0 && s=="table inet earnapp_limit {"){step=1;next}
+    if(step==1 && s=="chain output {"){step=2;next}
+    if(step==2 && (s=="type filter hook output priority filter - 10; policy accept;" || s=="type filter hook output priority -10; policy accept;")){step=3;next}
+    if(step==3 && first(s))next
+    if(step==4 && second(s))next
+    if(step==5 && s=="}"){step=6;next}
+    if(step==6 && s=="}"){step=7;next}
+    bad=1
+  }
+  END{exit bad || step!=7}'
+}
+
+# Ephemeral private-glibc CLI compatibility probe for the pinned EarnApp SDK.
+# No installed paths or SDK identity records are created or changed here.
+kr_sdk_private_query() (
+  [ "$#" = 2 ] || exit 1
+  kq_original=$1; kq_command=$2
+  case "$kq_command" in status|showid|--version) :;; *) exit 1;; esac
+  [ "$(id -u)" = 0 ] && kr_platform_supported || exit 1
+  kr_plain_path "$kq_original" && [ -f "$kq_original" ] && [ -r "$kq_original" ] || exit 1
+  kq_source_hash=$(hash_file "$kq_original") || exit 1
+  kr_sdk_source_hash_valid "$kq_source_hash" && kr_select_sdk_profile "$kq_source_hash" &&
+    kr_sdk_elf_valid "$kq_original" || exit 1
+  case "$KR_PROFILE_INTERP_OFFSET:$KR_PROFILE_INTERP_SIZE" in 792:28|848:28) :;; *) exit 1;; esac
+  kq_offset=$KR_PROFILE_INTERP_OFFSET; kq_size=$KR_PROFILE_INTERP_SIZE
+  kq_stage_hash=$KR_PROFILE_PATCHED_SHA
+  # This subshell never carries the caller's transaction descriptors into a
+  # downloader, private loader or SDK query; the caller keeps its own locks.
+  exec 5>&- 6>&- 7>&- 8>&- 9>&-
+  umask 077
+  kq_dir=$(mktemp -d /tmp/eq.XXXXXX) || exit 1
+  kq_owner=$(stat -c %u:%d:%i "$kq_dir") || { rmdir "$kq_dir"; exit 1; }
+  kq_cleanup() {
+    kq_exit=$?
+    trap - EXIT HUP INT TERM
+    case "$kq_dir" in /tmp/eq.??????) :;; *) exit 1;; esac
+    if kr_plain_path "$kq_dir" && [ -d "$kq_dir" ] &&
+       [ "$(stat -c %u:%d:%i "$kq_dir")" = "$kq_owner" ]; then
+      rm -rf "$kq_dir" || kq_exit=1
+    else
+      kr_error 'private SDK query temporary directory changed; cleanup refused'
+      kq_exit=1
+    fi
+    exit "$kq_exit"
+  }
+  trap kq_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  case "$kq_dir:$kq_owner" in /tmp/eq.??????:0:*) :;; *) exit 1;; esac
+  chmod 700 "$kq_dir" || exit 1
+  [ "$(stat -c %a "$kq_dir")" = 700 ] || exit 1
+  kq_runtime=$kq_dir/runtime
+  # The existing stager checks source, package, interpreter and library closure
+  # pins. Only its dependency packages may be fetched; cache stays in this tree.
+  kr_stage_runtime "$kq_runtime" "$kq_original" "$kq_dir/packages" >/dev/null 2>&1 || {
+    kr_error 'private SDK query dependency preparation failed'; exit 1;
+  }
+  [ "$(hash_file "$kq_runtime/xray")" = "$kq_stage_hash" ] || exit 1
+  kq_manifest=$(kr_runtime_fingerprint "$kq_runtime") && kr_private_closure "$kq_runtime" || exit 1
+  kq_loader_hash=$(hash_file "$kq_runtime/ld.so") || exit 1
+  [ "$kq_loader_hash" = "$(hash_file "$kq_runtime/lib/ld-linux-x86-64.so.2")" ] || exit 1
+  kq_loader=$kq_dir/ld.so
+  [ "${#kq_loader}" -le "$((kq_size-1))" ] || exit 1
+  cp "$kq_runtime/ld.so" "$kq_loader" && chmod 755 "$kq_loader" || exit 1
+  [ "$(hash_file "$kq_loader")" = "$kq_loader_hash" ] || exit 1
+  # Pad this short interpreter path to exactly the original, verified field.
+  printf '%s' "$kq_loader" >"$kq_dir/interp" || exit 1
+  dd if=/dev/zero bs=1 count="$((kq_size-${#kq_loader}))" 2>/dev/null >>"$kq_dir/interp" || exit 1
+  [ "$(wc -c <"$kq_dir/interp" | tr -d ' ')" = "$kq_size" ] || exit 1
+  kq_source_size=$(wc -c <"$kq_runtime/xray" | tr -d ' ') || exit 1
+  case "$kq_source_size" in ''|*[!0-9]*) exit 1;; esac
+  [ "$kq_source_size" -ge "$((kq_offset+kq_size))" ] || exit 1
+  # Independently hash prefix + new field + suffix. A completion marker plus
+  # the hash command's status prevents a failed producer becoming a valid row.
+  (
+    head -c "$kq_offset" "$kq_runtime/xray" || exit 1
+    cat "$kq_dir/interp" || exit 1
+    tail -c "+$((kq_offset+kq_size+1))" "$kq_runtime/xray" || exit 1
+    printf '%s\n' COMPLETE >"$kq_dir/producer-complete" || exit 1
+  ) | sha256sum >"$kq_dir/expected.sha" || exit 1
+  [ "$(cat "$kq_dir/producer-complete" 2>/dev/null)" = COMPLETE ] || exit 1
+  read -r kq_expected kq_hash_name <"$kq_dir/expected.sha" || exit 1
+  case "$kq_expected" in ''|*[!0-9a-f]*) exit 1;; esac
+  [ "${#kq_expected}" = 64 ] && [ "$kq_hash_name" = - ] || exit 1
+  kq_program=$kq_dir/query
+  cp "$kq_runtime/xray" "$kq_program" || exit 1
+  dd if="$kq_dir/interp" of="$kq_program" bs=1 seek="$kq_offset" conv=notrunc 2>/dev/null || exit 1
+  chmod 755 "$kq_program" || exit 1
+  [ "$(hash_file "$kq_program")" = "$kq_expected" ] &&
+    [ "$(hash_file "$kq_original")" = "$kq_source_hash" ] &&
+    [ "$(kr_runtime_fingerprint "$kq_runtime")" = "$kq_manifest" ] &&
+    [ "$(hash_file "$kq_loader")" = "$kq_loader_hash" ] || exit 1
+  # pkg reads /proc/self/exe, so execute the copied SDK itself, never ld.so SDK.
+  # Raw query output goes only to the caller; this module writes no query log.
+  kq_rc=0
+  timeout -k 2 15 env LD_LIBRARY_PATH="$kq_runtime/lib" "$kq_program" "$kq_command" || kq_rc=$?
+  [ "$(hash_file "$kq_original")" = "$kq_source_hash" ] || {
+    kr_error 'SDK source changed during the private query'; exit 1;
+  }
+  exit "$kq_rc"
+)
+
+# Narrow EarnApp bandwidth adapters for two explicitly recognized installations.
+# Detection and validation are read-only. Rendering writes only the supplied stage.
+# The engine owns publication, snapshot/seal, lifecycle integration and recovery.
+kr_site_error(){ printf 'FAIL: EarnApp site bandwidth: %s\n' "$*" >&2; return 1; }
+kr_site_select(){
+  KR_SITE=$1
+  case "$KR_SITE" in
+    none) KR_SITE_SOURCE_MODE=; return 0;;
+    kh1)
+      KR_SITE_SOURCE_MODE=700
+      KR_SITE_HELPER_SHA=1a69d30ead4020b5b142ce2306776777f208b27d042b59c445d69cf670e6e1c4
+      KR_SITE_INIT_SHA=57968797f18be78c51467feabfdf9ef0e3ee8d5ec8a1045e381e406ed1fa7236
+      KR_SITE_RECOVER_SHA=7504edfb0bdcab58c91d95d2a7b5014d124a67f0c2cb493ffb3582f20cc04ae2
+      KR_SITE_LIMIT_SHA=4bd38f49d05190014e819fa9ba99f2ca2e8eabcae02828f4729cd3598a03c5f3
+      KR_SITE_POLICY_SHA=2e4fce555c2a4df113a7238f29eb64e89e1704c543bc356bc2d3ad96e4cdbaeb;;
+    us6)
+      KR_SITE_SOURCE_MODE=755
+      KR_SITE_HELPER_SHA=bd4129944bbe81b98d80c2a2d1d71c6f10085c152081450b0041b30534358814
+      KR_SITE_INIT_SHA=8a884ebe7799d2fcd22ad26f3af1f341977afdfb2064535572fc547c751021ce
+      KR_SITE_RECOVER_SHA=db7a91955273a7912ce7f7fbf1128f47ee1b0f7b73f7373068ef04fce9a974cb
+      KR_SITE_LIMIT_SHA=c3a57e9b5c3333b015793b71117dce0848335c041ddeb36f5411fc5afb87afd5
+      KR_SITE_POLICY_SHA=0ec99d897be30704c0e2b27e0e97bd3495929fa3e93d170eb89837b58e10333d;;
+    *) KR_SITE=none; kr_site_error 'unknown site'; return 1;;
+  esac
+  KR_SITE_HELPER=/usr/local/sbin/earnapp-$KR_SITE-bandwidth
+  KR_SITE_TABLE=earnapp_${KR_SITE}_bw
+  KR_SITE_STATE=/run/earnapp-$KR_SITE-bw
+  KR_SITE_LOCK=/run/earnapp-$KR_SITE-bw.lockfile
+  KR_SITE_LOG=/var/log/earnapp-$KR_SITE-bandwidth.log
+}
+kr_site_file_guard(){
+  kr_plain_path "$1" && kr_plain "$1" && [ -f "$1" ] &&
+    [ "$(stat -c '%u:%g:%a:%h' "$1")" = "0:0:$3:1" ] &&
+    [ "$(hash_file "$1")" = "$2" ]
+}
+kr_site_sdk_identity(){
+  KID_RAW=$(timeout -k 2 10 "$1" showid 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || return 1
+  printf '%s\n' "$KID_RAW" | awk 'NR==1&&/^sdk-node-[0-9a-f]+$/&&length($0)==41{ok=1}END{exit !(ok&&NR==1)}' || { unset KID_RAW; return 1; }
+  KID_HASH=$(printf '%s' "$KID_RAW" | sha256sum) || { unset KID_RAW; return 1; }
+  unset KID_RAW
+  kr_hash_valid "${KID_HASH%% *}" || return 1
+  printf '%s\n' "${KID_HASH%% *}"
+}
+kr_site_guard_identity(){
+  # Parse only the data field in an already authenticated helper; never source
+  # or execute the helper. The public installer contains no fleet identity.
+  kr_plain_path "$1" && kr_plain "$1" && [ "$(hash_file "$1")" = "$KR_SITE_HELPER_SHA" ] || return 1
+  if [ "$KR_SITE" = kh1 ]; then
+    KGI_HASH=$(awk '
+      /^\[ "\$\{sdk_hash%% \*\}" = [0-9a-f]+ \] \|\| fail SDK_GUARD_FAILED$/ {if(length($5)!=64)bad=1;h=$5;n++}
+      END{if(bad||n!=1)exit 1;print h}' "$1") || return 1
+  else
+    KGI_RAW=$(awk '
+      /^\[ "\$sdk" = sdk-node-[0-9a-f]+ \] \|\| fail SDK_GUARD_FAILED$/ {if(length($4)!=41)bad=1;h=$4;n++}
+      END{if(bad||n!=1)exit 1;print h}' "$1") || return 1
+    KGI_HASH=$(printf '%s' "$KGI_RAW" | sha256sum) || { unset KGI_RAW; return 1; }; unset KGI_RAW
+    KGI_HASH=${KGI_HASH%% *}
+  fi
+  kr_hash_valid "$KGI_HASH" || return 1
+  printf '%s\n' "$KGI_HASH"
+}
+kr_site_source_guard(){
+  [ "${KR_SITE:-none}" != none ] || return 0
+  [ "$(uname -m)" = x86_64 ] || return 1
+  kr_site_file_guard "$KR_SITE_HELPER" "$KR_SITE_HELPER_SHA" "$KR_SITE_SOURCE_MODE" &&
+    kr_site_file_guard /etc/init.d/earnapp "$KR_SITE_INIT_SHA" 755 &&
+    kr_site_file_guard /usr/local/sbin/earnapp-recover "$KR_SITE_RECOVER_SHA" 755 &&
+    kr_site_file_guard /usr/local/sbin/earnapp-limit "$KR_SITE_LIMIT_SHA" 755 || return 1
+  kr_plain_path /usr/bin/earnapp && kr_plain /usr/bin/earnapp &&
+    [ "$(hash_file /usr/bin/earnapp)" = "$KR_SDK_SHA" ] || return 1
+  KSI_EXPECTED=$(kr_site_guard_identity "$KR_SITE_HELPER") && KSI_ACTUAL=$(kr_site_sdk_identity /usr/bin/earnapp) || return 1
+  [ "$KSI_ACTUAL" = "$KSI_EXPECTED" ] || return 1
+  if [ -n "${KR_SITE_IDENTITY_SHA:-}" ]; then [ "$KR_SITE_IDENTITY_SHA" = "$KSI_ACTUAL" ] || return 1; fi
+  KR_SITE_DEVICE_SHA=$KSI_ACTUAL; KR_SITE_IDENTITY_SHA=$KSI_ACTUAL
+}
+kr_site_detect(){
+  kr_site_select none || return 1
+  KR_SITE_IDENTITY_SHA=; KR_SITE_DEVICE_SHA=
+  if [ -e /usr/local/sbin/earnapp-kh1-bandwidth ] || [ -L /usr/local/sbin/earnapp-kh1-bandwidth ]; then kr_site_select kh1 || return 1
+  elif [ -e /usr/local/sbin/earnapp-us6-bandwidth ] || [ -L /usr/local/sbin/earnapp-us6-bandwidth ]; then kr_site_select us6 || return 1
+  else return 0; fi
+  for KSD_P in /usr/local/sbin/earnapp-kh1-bandwidth /usr/local/sbin/earnapp-us6-bandwidth; do
+    [ "$KSD_P" = "$KR_SITE_HELPER" ] && continue
+    if [ -e "$KSD_P" ] || [ -L "$KSD_P" ]; then kr_site_error 'cross-site helper retained'; return 1; fi
+  done
+  kr_site_source_guard || { kr_site_error 'source hash, metadata or application identity is unknown'; return 1; }
+}
+kr_site_snapshot_paths(){
+  [ "${KR_SITE:-none}" != none ] || return 0
+  printf '%s\n' "$KR_SITE_HELPER" "$KR_SITE_STATE/inode" "$KR_SITE_STATE/status"
+}
+kr_site_metadata_paths(){
+  [ "${KR_SITE:-none}" != none ] || return 0
+  printf '%s\n' "$KR_SITE_STATE" "$KR_SITE_LOCK" "$KR_SITE_LOG" "$KR_SITE_LOG.1"
+}
+kr_site_plan_rows(){
+  [ "${KR_SITE:-none}" != none ] || return 0
+  printf '%s %s 700\n' "$KR_SITE_HELPER" "$1/helper"
+}
+kr_site_policy_digest(){
+  # Keep the exact historical normalization: nft may display burst as 4kbytes.
+  sed -E 's/packets [0-9]+ bytes [0-9]+/packets bytes/g; s/socket cgroupv2 level 1 ("[^"]*"|0[xX][0-9a-fA-F]+|[0-9]+)/socket cgroupv2 level 1 "__cgroup__"/g' |
+    sha256sum | awk '{print $1}'
+}
+kr_site_validate_table(){
+  [ "${KR_SITE:-none}" != none ] || return 0
+  case "$1" in ''|0|*[!0-9]*) return 1;; esac
+  KSV_TEXT=$(nft -nn list table inet "$KR_SITE_TABLE") || return 1
+  [ "$(printf '%s\n' "$KSV_TEXT" | kr_site_policy_digest)" = "$KR_SITE_POLICY_SHA" ] || return 1
+  KSV_NET=$(nft --debug=netlink -nn list table inet "$KR_SITE_TABLE" 2>&1) || return 1
+  KSV_WORDS=$(printf '%s\n' "$KSV_NET" | awk '
+    /^[ \t]*\[ socket load cgroupv2 => reg 1 \][ \t]*$/ {if(pending)bad=1;pending=1;next}
+    pending {if($0 !~ /^[ \t]*\[ cmp eq reg 1 0x[0-9a-fA-F]+ 0x[0-9a-fA-F]+ \][ \t]*$/ || length($6)!=10 || length($7)!=10)bad=1;else print $6,$7;pending=0;n++}
+    END{exit bad||pending||n!=2}') || return 1
+  set -- "$1" $KSV_WORDS
+  [ "$#" = 5 ] || return 1
+  KSV_I=$1
+  [ "$(printf '%u' "$3")" = 0 ] && [ "$(printf '%u' "$5")" = 0 ] &&
+    [ "$(printf '%u' "$2")" = "$KSV_I" ] && [ "$(printf '%u' "$4")" = "$KSV_I" ]
+}
+kr_site_emit_library(){
+  case "$1" in openrc.xray-runtime|openrc.earnapp) :;; *) return 1;; esac
+  cat <<'KS_LIBRARY' | awk -v expected="$1" '
+    $0=="    case \"$SITE_GROUP\" in openrc.xray-runtime|openrc.earnapp) :;; *) return 1;; esac" {
+      print "    [ \"$SITE_GROUP\" = \""expected"\" ] || return 1";n++;next
+    }{print}END{exit n!=1}'
+# Same two rules, same shared limit object/counters; no table replacement.
+site_handle_valid(){
+    case "$1" in ''|0|*[!0-9]*) return 1;; esac
+    [ "${#1}" -le 10 ] && [ "$1" -le 4294967295 ]
+}
+site_rebind_rules() {
+    site_handle_valid "$1" && site_handle_valid "$2" && [ "$1" != "$2" ] || return 1
+    case "$T" in earnapp_kh1_bw|earnapp_us6_bw) :;; *) return 1;; esac
+    case "$SITE_GROUP" in openrc.xray-runtime|openrc.earnapp) :;; *) return 1;; esac
+    printf 'replace rule inet %s input handle %s iifname "eth0" meta l4proto { tcp, udp } socket cgroupv2 level 1 "%s" counter name ea_in_total limit name shared_1mbps counter name ea_in_drop drop\n' "$T" "$1" "$SITE_GROUP"
+    printf 'replace rule inet %s output handle %s oifname "eth0" meta l4proto { tcp, udp } socket cgroupv2 level 1 "%s" counter name ea_out_total limit name shared_1mbps counter name ea_out_drop drop\n' "$T" "$2" "$SITE_GROUP"
+}
+site_read_handles() {
+    local listing pair
+    listing=$(nft -a -nn list table inet "$T") || return 1
+    pair=$(printf '%s\n' "$listing" | awk '
+      {s=$0;sub(/^[ \t]+/,"",s)}
+      s ~ /^chain input \{/ {chain="input";next}
+      s ~ /^chain output \{/ {chain="output";next}
+      s ~ /^}/ {chain="";next}
+      s ~ /socket cgroupv2/ {
+        n=split(s,a," "); h=a[n]
+        if(a[n-2]!="#"||a[n-1]!="handle"||h!~/^[1-9][0-9]*$/||length(h)>10||h+0>4294967295)bad=1
+        if(chain=="input" && !ni++){hi=h}
+        else if(chain=="output" && !no++){ho=h}
+        else bad=1
+      }
+      END{if(bad||ni!=1||no!=1||hi==ho)exit 1;print hi,ho}') || return 1
+    set -- $pair
+    [ "$#" = 2 ] || return 1
+    SITE_HI=$1; SITE_HO=$2
+}
+KS_LIBRARY
+}
+kr_site_render(){
+  [ "$#" -ge 2 ] && [ "$#" -le 3 ] && [ "${KR_SITE:-none}" != none ] || return 1
+  KSR_SOURCE=$1; KSR_DIR=$2
+  [ "$KR_SERVICE:$KR_PROGRAM" = xray-runtime:/opt/xray-runtime/xray ] || return 1
+  case "${3:-canonical}" in
+    canonical) KSR_SERVICE=xray-runtime; KSR_PROGRAM=/opt/xray-runtime/xray;;
+    source) KSR_SERVICE=earnapp; KSR_PROGRAM=/usr/bin/earnapp;;
+    *) return 1;;
+  esac
+  [ "${KR_SITE_IDENTITY_SHA:-}" = "$KR_SITE_DEVICE_SHA" ] || return 1
+  kr_plain_path "$KSR_SOURCE" && kr_plain "$KSR_SOURCE" &&
+    [ "$(hash_file "$KSR_SOURCE")" = "$KR_SITE_HELPER_SHA" ] || return 1
+  kr_plain_path "$KSR_DIR" && [ -d "$KSR_DIR" ] && [ ! -L "$KSR_DIR" ] || return 1
+  for KSR_FILE in helper helper.next rebind-library hook.init hook.recover hook.limit site.settings; do
+    [ ! -e "$KSR_DIR/$KSR_FILE" ] && [ ! -L "$KSR_DIR/$KSR_FILE" ] || return 1
+  done
+  kr_site_emit_library "openrc.$KSR_SERVICE" >"$KSR_DIR/rebind-library" || return 1
+  awk -v lib="$KSR_DIR/rebind-library" -v device="$KR_SITE_DEVICE_SHA" -v site="$KR_SITE" -v service="$KSR_SERVICE" -v program="$KSR_PROGRAM" '
+    /^# PREPARATION ONLY:/ {print "# EarnApp: validated site bandwidth adapter; shared aggregate 1Mbps.";next}
+    /^cleanup\(\) \{/ {
+      while((getline line <lib)>0)print line
+      close(lib);library++;print;next
+    }
+    /^C=\/sys\/fs\/cgroup\/openrc[.]earnapp$/ {print "C=/sys/fs/cgroup/openrc."service;print "SITE_GROUP=openrc."service;cg++;next}
+    /\[ "\$sdk" = sdk-node-/ {
+      print "sdk_hash=$(printf '\''%s'\'' \"$sdk\" | sha256sum) || fail SDK_GUARD_FAILED"
+      print "[ \"${sdk_hash%% *}\" = "device" ] || fail SDK_GUARD_FAILED"
+      raw++;next
+    }
+    /grep -Fx \/usr\/bin\/earnapp / {gsub(/\/usr\/bin\/earnapp/,program);argv++}
+    /pgrep -f / && /supervise-daemon earnapp / {gsub(/supervise-daemon earnapp /,"supervise-daemon "service" ");sup++}
+    /RC_SVCNAME-/ {gsub(/= earnapp /,"= "service" ");gsub(/\/etc\/init[.]d\/earnapp/,"/etc/init.d/"service);pre++}
+    {gsub(/openrc[.]earnapp/,"openrc."service)}
+    /^# The delete and replacement share one nft transaction/ {
+      print "# Rebind only the two validated rule handles, keeping objects/counters."
+      print "if [ \"$EXISTS\" = 1 ]; then"
+      print "    site_read_handles || fail RULE_HANDLES_UNKNOWN"
+      print "    EXPECT_HI=$SITE_HI; EXPECT_HO=$SITE_HO"
+      print "    site_rebind_rules \"$EXPECT_HI\" \"$EXPECT_HO\" >\"$WORK/apply.nft\" || fail TRANSACTION_WRITE_FAILED"
+      print "else"
+      tx++;next
+    }
+    /if \[ "\$EXISTS" = 1 \]; then printf/ && /delete table inet earnapp_/ {deleted++;next}
+    /} >"\$WORK\/apply.nft" \|\| fail TRANSACTION_WRITE_FAILED/ {print;print "fi";close_tx++;next}
+    /\[ "\$BOUND" = "\$CACHE" \] \|\| fail BINDING_CHANGED_BEFORE_APPLY/ {
+      print
+      print "    site_read_handles || fail RULE_HANDLES_UNKNOWN_BEFORE_APPLY"
+      print "    [ \"$SITE_HI:$SITE_HO\" = \"$EXPECT_HI:$EXPECT_HO\" ] || fail RULE_HANDLES_CHANGED_BEFORE_APPLY"
+      cas++;next
+    }
+    {print}
+    END{if(cg!=1||library!=1||argv!=1||sup!=2||pre!=1||tx!=1||deleted!=1||close_tx!=1||cas!=1||(site=="us6"?raw!=1:raw!=0))exit 1}
+  ' "$KSR_SOURCE" >"$KSR_DIR/helper.next" || { rm -f "$KSR_DIR/helper.next"; return 1; }
+  # The pinned source may contain an old identity literal. No generated file may.
+  if grep -Eq 'sdk-node-[0-9a-f]{32}|delete table inet earnapp_' "$KSR_DIR/helper.next" ||
+    { [ "$KSR_SERVICE" = xray-runtime ] && grep -Eq 'openrc\.earnapp|supervise-daemon earnapp ' "$KSR_DIR/helper.next"; }; then
+    rm -f "$KSR_DIR/helper.next"; return 1
+  fi
+  sh -n "$KSR_DIR/helper.next" && chmod 700 "$KSR_DIR/helper.next" && mv "$KSR_DIR/helper.next" "$KSR_DIR/helper" || return 1
+  printf 'if ! %s --prestart; then ewarn "EarnApp %s bandwidth rebind failed; application startup continues"; fi\n' "$KR_SITE_HELPER" "$KR_SITE" >"$KSR_DIR/hook.init" || return 1
+  printf '%s apply || log %s_BANDWIDTH_REBIND_FAILED\n' "$KR_SITE_HELPER" "$KR_SITE" >"$KSR_DIR/hook.recover" || return 1
+  printf '%s apply || { log %s_BANDWIDTH_REBIND_FAILED; return 2; }\n' "$KR_SITE_HELPER" "$KR_SITE" >"$KSR_DIR/hook.limit" || return 1
+  printf 'APPLICATION=EarnApp\nSITE=%s\nSERVICE=%s\nPROGRAM=%s\nCGROUP=/openrc.%s\nHELPER=%s\nTABLE=%s\nIDENTITY_SHA256=%s\nPOLICY_SHA256=%s\n' "$KR_SITE" "$KSR_SERVICE" "$KSR_PROGRAM" "$KSR_SERVICE" "$KR_SITE_HELPER" "$KR_SITE_TABLE" "$KR_SITE_DEVICE_SHA" "$KR_SITE_POLICY_SHA" >"$KSR_DIR/site.settings" || return 1
+  chmod 600 "$KSR_DIR/rebind-library" "$KSR_DIR/hook.init" "$KSR_DIR/hook.recover" "$KSR_DIR/hook.limit" "$KSR_DIR/site.settings"
+}
+kr_site_stage(){
+  [ "$#" = 3 ] || return 1
+  [ "${KR_SITE:-none}" != none ] || return 0
+  [ "$2:$3" = earnapp:/usr/bin/earnapp ] || return 1
+  kr_site_source_guard || return 1
+  kr_site_render "$KR_SITE_HELPER" "$1"
+}
+
+# Read-only recognition of HK1's exact known EarnApp wrapper and stderr logger.
+# This adapter never changes links, permissions, processes, services or logs.
+KR_HK1_SOURCE_SERVICE=earnapp
+KR_HK1_SOURCE_PROGRAM=/usr/local/sbin/hk1-runtime/bin/xray
+KR_HK1_ORIGINAL=/usr/bin/earnapp
+KR_HK1_SDK_SHA=a5080f9eff9df9f59a2192ccafc344f06259bfffe2a0aee619d44c8cafbd8def
+kr_hk1_error(){ printf 'FAIL: HK1 EarnApp adapter: %s\n' "$*" >&2; return 1; }
+kr_hk1_file_guard(){
+  kr_plain_path "$1" && kr_plain "$1" && [ -f "$1" ] &&
+    [ "$(stat -c '%u:%g:%a:%h' "$1")" = "0:0:$3:1" ] &&
+    [ "$(hash_file "$1")" = "$2" ]
+}
+kr_hk1_pair_metadata(){
+  [ "$#" = 2 ] && [ "$1" = "$2" ] || return 1
+  printf '%s\n' "$1" | awk '$0~/^[0-9]+:[1-9][0-9]*:0:0:755:2$/{ok=1}END{exit !ok}'
+}
+kr_hk1_sdk_pair_guard(){
+  case "$1" in /usr/bin/earnapp|/usr/local/sbin/hk1-runtime/bin/xray) :;; *) return 1;; esac
+  for KHP_PATH in /usr/bin/earnapp /usr/local/sbin/hk1-runtime/bin/xray; do
+    kr_plain_path "$KHP_PATH" && [ -f "$KHP_PATH" ] && [ ! -L "$KHP_PATH" ] || return 1
+    [ "$(hash_file "$KHP_PATH")" = "$KR_HK1_SDK_SHA" ] || return 1
+  done
+  kr_hk1_pair_metadata "$(stat -c '%d:%i:%u:%g:%a:%h' /usr/bin/earnapp)" "$(stat -c '%d:%i:%u:%g:%a:%h' /usr/local/sbin/hk1-runtime/bin/xray)"
+}
+kr_hk1_topology_guard(){
+  kr_hk1_sdk_pair_guard /usr/bin/earnapp &&
+    kr_hk1_file_guard /usr/local/sbin/hk1-runtime/start 902b291c70fdebf8343c6179609167bb3efc142f46b894387952f1f7938a81b9 700 &&
+    kr_hk1_file_guard /usr/local/sbin/ea-stderr-counts 2de0e2bf9fee3e7377658ccc3f074d0f4c8004f4855b8c73e021e56601d21ec3 700 || return 1
+  # Only this leaf symlink is allowed; its ancestors remain plain directories.
+  kr_plain_path /usr/local/sbin/hk1-runtime/loader &&
+    [ -L /usr/local/sbin/hk1-runtime/loader/xray ] &&
+    [ "$(readlink /usr/local/sbin/hk1-runtime/loader/xray)" = /lib/ld-musl-x86_64.so.1 ] &&
+    [ "$(stat -c '%u:%g' /usr/local/sbin/hk1-runtime/loader/xray)" = 0:0 ] &&
+    [ -f /lib/ld-musl-x86_64.so.1 ] && [ -x /lib/ld-musl-x86_64.so.1 ]
+}
+kr_hk1_runtime_guard(){
+  [ "$(uname -m)" = x86_64 ] && kr_hash_valid "${KR_HK1_IDENTITY_SHA:-}" || return 1
+  kr_hk1_topology_guard &&
+    kr_hk1_file_guard /etc/init.d/earnapp 90d44c099980279935cc5ca0a5ae511fdbf4e053ee943afff68d41853f8d33a5 755 || return 1
+  (OLD_SVC=earnapp; suite_source_config_valid) || return 1
+  [ "$(kr_hk1_read_identity)" = "$KR_HK1_IDENTITY_SHA" ]
+}
+kr_hk1_read_identity(){
+  kr_hk1_topology_guard || return 1
+  KHI_ORIGINAL=$(kr_site_sdk_identity /usr/bin/earnapp) &&
+    KHI_ALIAS=$(kr_site_sdk_identity /usr/local/sbin/hk1-runtime/bin/xray) || return 1
+  [ "$KHI_ORIGINAL" = "$KHI_ALIAS" ] || return 1
+  printf '%s\n' "$KHI_ORIGINAL"
+}
+kr_hk1_source_guard(){
+  kr_hk1_runtime_guard &&
+    kr_hk1_file_guard /usr/local/lib/earnapp-original.sh c4f06db679665639dc6e6bede7be31f9743ac943041f5861f5d2ee882c11cb80 644 &&
+    kr_hk1_file_guard /usr/local/sbin/earnapp-watchdog ef34020fb854b861b546ed865729582d69efcf236bbe91964a910e341017f90a 755 &&
+    kr_hk1_file_guard /usr/local/sbin/earnapp-recover 3c4f6be23a5cfd36be5802d4f73fe3d0b2dee206afcb600b84e0230d953cc87a 755 &&
+    kr_hk1_file_guard /usr/local/sbin/earnapp-limit 7d73699a7d93cd4620c877b89c863fecafae930f8426c5964347993f45fa8e7b 755 &&
+    kr_hk1_file_guard /etc/local.d/earnapp-limit.start eff856125ffadef714d4b7bf5188f09c7d60568dfd2cfe7b6cb0b2a041d7f806 755 || return 1
+}
+kr_hk1_detect(){
+  KR_HK1=0
+  [ -e /usr/local/sbin/hk1-runtime ] || [ -L /usr/local/sbin/hk1-runtime ] || return 0
+  KR_HK1_IDENTITY_SHA=$(kr_hk1_read_identity) || return 1
+  KR_HK1_ID_SHA=$KR_HK1_IDENTITY_SHA
+  kr_hk1_source_guard || { kr_hk1_error 'source bytes, links, logger or identity are unknown'; return 1; }
+  KR_HK1=1
+}
+kr_hk1_static_paths(){
+  printf '%s\n' /usr/local/sbin/hk1-runtime/start /usr/local/sbin/hk1-runtime/bin/xray /usr/local/sbin/hk1-runtime/loader/xray /usr/local/sbin/ea-stderr-counts
+}
+kr_hk1_init_logger(){ printf '%s\n' 'error_logger="exec /usr/local/sbin/ea-stderr-counts"'; }
+kr_hk1_argv_file(){
+  # Reject embedded newlines before converting NUL arguments into records.
+  od -An -v -t u1 "$1" | awk '{for(i=1;i<=NF;i++){if($i==0)n++;if($i==10)bad=1}}END{exit !(n==8&&!bad)}' || return 1
+  tr '\000' '\n' <"$1" | awk '
+    NR==1 {if($0!="ld-linux-x86-64.so.2"&&$0!="/lib/ld-musl-x86_64.so.1"&&$0!="/usr/local/sbin/hk1-runtime/loader/xray")bad=1;next}
+    NR==2 {if($0!="--argv0")bad=1;next}
+    NR==3 {if($0!="xray")bad=1;next}
+    NR==4 {if($0!="--preload")bad=1;next}
+    NR==5 {if($0!="/lib/libgcompat.so.0 "&&$0!="/lib/libgcompat.so.0")bad=1;next}
+    NR==6 {if($0!="--")bad=1;next}
+    NR==7 {if($0!="/usr/local/sbin/hk1-runtime/bin/xray")bad=1;next}
+    NR==8 {if($0!="run")bad=1;next}
+    END {exit !(NR==8&&!bad)}'
+}
+kr_hk1_logger_argv(){
+  od -An -v -t u1 "$1" | awk '{for(i=1;i<=NF;i++){if($i==0)n++;if($i==10)bad=1}}END{exit !(n==2&&!bad)}' || return 1
+  tr '\000' '\n' <"$1" | awk 'NR==1{if($0!="/bin/ash"&&$0!="/bin/sh")bad=1}NR==2{if($0!="/usr/local/sbin/ea-stderr-counts")bad=1}END{exit bad||NR!=2}'
+}
+kr_hk1_root_process(){
+  awk '/^Uid:/{ok=(NF==5&&$2==0&&$3==0&&$4==0&&$5==0)}END{exit !ok}' "/proc/$1/status"
+}
+kr_hk1_program_match() (
+  # 0=known mapped SDK; 1=other process; 2=ambiguous owned reference.
+  KHM_PROC=$1
+  for KHM_PATH in /usr/bin/earnapp /usr/local/sbin/hk1-runtime/bin/xray; do
+    if mapped_program_matches "$KHM_PROC" "$KHM_PATH"; then exit 0; fi
+  done
+  [ -r "$KHM_PROC/maps" ] || { [ ! -d "$KHM_PROC" ] && exit 1; exit 2; }
+  if awk '$6=="/usr/bin/earnapp"||$6=="/usr/local/sbin/hk1-runtime/bin/xray"{found=1}END{exit !found}' "$KHM_PROC/maps"; then exit 2; fi
+  KHM_ARGS=$(tr '\000' '\n' <"$KHM_PROC/cmdline" 2>/dev/null) || { [ ! -d "$KHM_PROC" ] && exit 1; exit 2; }
+  if printf '%s\n' "$KHM_ARGS" | grep -Eq '^(/usr/bin/earnapp|/usr/local/sbin/hk1-runtime/(bin/xray|start))$'; then exit 2; fi
+  exit 1
+)
+kr_hk1_logger_snapshot() (
+  [ "$#" -ge 1 ] && [ "$#" -le 3 ] || exit 1
+  kr_hk1_file_guard /usr/local/sbin/ea-stderr-counts 2de0e2bf9fee3e7377658ccc3f074d0f4c8004f4855b8c73e021e56601d21ec3 700 || exit 1
+  KHL_PARENT=$1; KHL_WORKER=${2:-}; KHL_GROUP=${3:-/openrc.earnapp}
+  case "$KHL_GROUP" in /openrc.earnapp|/openrc.xray-runtime) :;; *) exit 1;; esac
+  case "$KHL_PARENT" in ''|*[!0-9]*) exit 1;; esac
+  KHL_PS=$(process_stamp "$KHL_PARENT") || exit 1
+  KHL_FOUND=
+  for KHL_PROC in /proc/[0-9]*; do
+    [ -d "$KHL_PROC" ] || continue
+    kr_hk1_logger_argv "$KHL_PROC/cmdline" >/dev/null 2>&1 || continue
+    KHL_PID=${KHL_PROC##*/}; KHL_STAMP=$(process_stamp "$KHL_PID") || exit 1
+    KHL_EXPECTED_PARENT=$KHL_PARENT
+    [ -z "$KHL_WORKER" ] || KHL_EXPECTED_PARENT=$KHL_WORKER
+    [ "${KHL_STAMP%%:*}" = "$KHL_EXPECTED_PARENT" ] || continue
+    [ -z "$KHL_FOUND" ] && kr_hk1_root_process "$KHL_PID" || exit 1
+    [ ! -e "$KHL_PROC/fd/9" ] && [ ! -L "$KHL_PROC/fd/9" ] || exit 1
+    KHL_EXE=$(readlink "$KHL_PROC/exe") && KHL_ASH=$(readlink -f /bin/ash) || exit 1
+    [ "$KHL_EXE" = "$KHL_ASH" ] || exit 1
+    [ "$(awk -F: '$1==0{print $3}' "$KHL_PROC/cgroup")" = "$KHL_GROUP" ] || exit 1
+    if [ -n "$KHL_WORKER" ]; then
+      KHL_PIPE=$(readlink "/proc/$KHL_WORKER/fd/2") || exit 1
+      case "$KHL_PIPE" in pipe:\[*\]) :;; *) exit 1;; esac
+      [ "$(readlink "$KHL_PROC/fd/0")" = "$KHL_PIPE" ] || exit 1
+    fi
+    [ "$(process_stamp "$KHL_PID")" = "$KHL_STAMP" ] || exit 1
+    KHL_FOUND="$KHL_PID:${KHL_STAMP#*:}"
+  done
+  [ -n "$KHL_FOUND" ] && [ "$(process_stamp "$KHL_PARENT")" = "$KHL_PS" ] &&
+    kr_hk1_file_guard /usr/local/sbin/ea-stderr-counts 2de0e2bf9fee3e7377658ccc3f074d0f4c8004f4855b8c73e021e56601d21ec3 700 || exit 1
+  printf '%s\n' "$KHL_FOUND"
+)
+kr_hk1_source_worker() (
+  # Maintenance scripts may already be replaced by sealed pause bytes. Worker
+  # recognition depends on the immutable startup topology, not retired helpers.
+  kr_hk1_runtime_guard && [ "$(service_state earnapp)" = 0 ] || exit 1
+  KHW_PID=$(suite_updater_meta_value earnapp child_pid) && KHW_FILE=$(suite_updater_meta_value earnapp pidfile) || exit 1
+  case "$KHW_PID" in ''|*[!0-9]*) exit 1;; esac
+  case "$KHW_FILE" in /var/run/supervise-earnapp.pid|/run/supervise-earnapp.pid) :;; *) exit 1;; esac
+  [ -f "$KHW_FILE" ] && [ ! -L "$KHW_FILE" ] || exit 1
+  KHW_PARENT=$(cat "$KHW_FILE") || exit 1
+  case "$KHW_PARENT" in ''|*[!0-9]*) exit 1;; esac
+  KHW_STAMP=$(process_stamp "$KHW_PID") && KHW_PS=$(process_stamp "$KHW_PARENT") || exit 1
+  [ "${KHW_STAMP%%:*}" = "$KHW_PARENT" ] || exit 1
+  KHW_SUP=$(command -v supervise-daemon) && KHW_SUP=$(readlink -f "$KHW_SUP") || exit 1
+  [ "$(readlink "/proc/$KHW_PARENT/exe")" = "$KHW_SUP" ] || exit 1
+  tr '\000' '\n' <"/proc/$KHW_PARENT/cmdline" | awk 'NR==2{ok=($0=="earnapp")}END{exit !ok}' || exit 1
+  kr_hk1_root_process "$KHW_PID" && kr_hk1_root_process "$KHW_PARENT" || exit 1
+  [ "$(readlink "/proc/$KHW_PID/exe")" = /lib/ld-musl-x86_64.so.1 ] &&
+    kr_hk1_argv_file "/proc/$KHW_PID/cmdline" && kr_hk1_program_match "/proc/$KHW_PID" || exit 1
+  for KHW_P in "$KHW_PID" "$KHW_PARENT"; do
+    [ "$(awk -F: '$1==0{print $3}' "/proc/$KHW_P/cgroup")" = /openrc.earnapp ] || exit 1
+  done
+  KHW_LOGGER=$(kr_hk1_logger_snapshot "$KHW_PARENT" "$KHW_PID") || exit 1
+  for KHW_PROC in /proc/[0-9]*; do
+    [ -d "$KHW_PROC" ] || continue
+    [ "${KHW_PROC##*/}" != "$KHW_PARENT" ] || continue
+    KHW_MATCH=0; kr_hk1_program_match "$KHW_PROC" || KHW_MATCH=$?
+    case "$KHW_MATCH" in 1) continue;; 0) [ "${KHW_PROC##*/}" = "$KHW_PID" ] || exit 1;; *) exit 1;; esac
+  done
+  [ "$(suite_updater_meta_value earnapp child_pid)" = "$KHW_PID" ] &&
+    [ "$(cat "$KHW_FILE")" = "$KHW_PARENT" ] &&
+    [ "$(process_stamp "$KHW_PID")" = "$KHW_STAMP" ] &&
+    [ "$(process_stamp "$KHW_PARENT")" = "$KHW_PS" ] &&
+    [ "$(kr_hk1_logger_snapshot "$KHW_PARENT" "$KHW_PID")" = "$KHW_LOGGER" ] || exit 1
+  printf '%s:%s\n' "$KHW_PID" "${KHW_STAMP#*:}"
+)
+kr_hk1_source_absent() (
+  kr_hk1_topology_guard || exit 1
+  KHA_CHILD=$(suite_updater_meta_value earnapp child_pid) && KHA_FILE=$(suite_updater_meta_value earnapp pidfile) || exit 1
+  case "$KHA_CHILD" in ''|0) :;; *[!0-9]*) exit 1;; *) [ ! -d "/proc/$KHA_CHILD" ] || exit 1;; esac
+  if [ -n "$KHA_FILE" ]; then
+    case "$KHA_FILE" in /var/run/supervise-earnapp.pid|/run/supervise-earnapp.pid) :;; *) exit 1;; esac
+    if [ -e "$KHA_FILE" ] || [ -L "$KHA_FILE" ]; then
+      [ -f "$KHA_FILE" ] && [ ! -L "$KHA_FILE" ] || exit 1
+      KHA_PARENT=$(cat "$KHA_FILE") || exit 1
+      case "$KHA_PARENT" in ''|*[!0-9]*) exit 1;; esac
+      [ ! -d "/proc/$KHA_PARENT" ] || exit 1
+    fi
+  fi
+  for KHA_PROC in /proc/[0-9]*; do
+    [ -d "$KHA_PROC" ] || continue
+    KHA_MATCH=0; kr_hk1_program_match "$KHA_PROC" || KHA_MATCH=$?
+    [ "$KHA_MATCH" = 1 ] || exit 1
+  done
+)
+
+# Engine bridge for the recognized EarnApp site adapters. No entry dispatch.
+# All inactive hooks return true. Call optional source validators only if their
+# flag is active; source_worker otherwise returns true with no worker output.
+kr_ext_active(){ [ "${KR_SITE:-none}" != none ] || [ "${KR_HK1:-0}" = 1 ]; }
+kr_ext_settings(){
+  KES_SITE_ID=-; KES_HK_ID=-
+  [ "${KR_SITE:-none}" = none ] || KES_SITE_ID=${KR_SITE_IDENTITY_SHA:-}
+  [ "${KR_HK1:-0}" != 1 ] || KES_HK_ID=${KR_HK1_IDENTITY_SHA:-}
+  printf 'APPLICATION=EarnApp\nSITE=%s\nHK1=%s\nSITE_IDENTITY_SHA=%s\nHK1_IDENTITY_SHA=%s\n' "${KR_SITE:-none}" "${KR_HK1:-0}" "$KES_SITE_ID" "$KES_HK_ID"
+}
+kr_ext_detect(){
+  KR_EXT_ACTIVE=0; KR_SITE=none; KR_HK1=0
+  kr_site_detect && kr_hk1_detect || return 1
+  if [ "$KR_HK1" = 1 ]; then
+    KE_SOURCE_SERVICE=earnapp; KE_SOURCE_PROGRAM=$KR_HK1_SOURCE_PROGRAM; KE_ORIGINAL=$KR_HK1_ORIGINAL
+  fi
+  kr_ext_active && KR_EXT_ACTIVE=1
+  return 0
+}
+kr_ext_identity_current(){
+  if [ "${KR_HK1:-0}" = 1 ]; then kr_hk1_read_identity
+  else
+    kr_plain_path /usr/bin/earnapp && kr_plain /usr/bin/earnapp &&
+      [ "$(hash_file /usr/bin/earnapp)" = "$KR_SDK_SHA" ] || return 1
+    kr_site_sdk_identity /usr/bin/earnapp
+  fi
+}
+kr_ext_load(){
+  KR_SITE=none; KR_HK1=0; KR_EXT_ACTIVE=0
+  if [ ! -f "$KE_B/sealed/extension.settings" ]; then
+    for KEL_PATH in /usr/local/sbin/earnapp-kh1-bandwidth /usr/local/sbin/earnapp-us6-bandwidth /usr/local/sbin/hk1-runtime; do
+      [ ! -e "$KEL_PATH" ] && [ ! -L "$KEL_PATH" ] || return 1
+    done
+    return 0
+  fi
+  awk -F= '
+    $1=="APPLICATION"&&$2=="EarnApp"{a++;next}
+    $1=="SITE"&&($2=="none"||$2=="kh1"||$2=="us6"){s++;next}
+    $1=="HK1"&&($2=="0"||$2=="1"){h++;next}
+    ($1=="SITE_IDENTITY_SHA"||$1=="HK1_IDENTITY_SHA")&&($2=="-"||($2~/^[0-9a-f]+$/&&length($2)==64)){if(seen[$1]++)bad=1;d++;next}
+    {bad=1}END{exit bad||a!=1||s!=1||h!=1||d!=2||NR!=5}' "$KE_B/sealed/extension.settings" || return 1
+  KEL_SITE=$(sed -n 's/^SITE=//p' "$KE_B/sealed/extension.settings")
+  KR_HK1=$(sed -n 's/^HK1=//p' "$KE_B/sealed/extension.settings")
+  KR_SITE_IDENTITY_SHA=$(sed -n 's/^SITE_IDENTITY_SHA=//p' "$KE_B/sealed/extension.settings")
+  KR_HK1_IDENTITY_SHA=$(sed -n 's/^HK1_IDENTITY_SHA=//p' "$KE_B/sealed/extension.settings")
+  kr_site_select "$KEL_SITE" || return 1
+  if [ "$KR_SITE" != none ]; then
+    [ "$KR_HK1" = 0 ] && kr_hash_valid "$KR_SITE_IDENTITY_SHA" && [ "$KR_HK1_IDENTITY_SHA" = - ] || return 1
+    KR_SITE_DEVICE_SHA=$KR_SITE_IDENTITY_SHA
+  else [ "$KR_SITE_IDENTITY_SHA" = - ] || return 1; fi
+  if [ "$KR_HK1" = 1 ]; then kr_hash_valid "$KR_HK1_IDENTITY_SHA" || return 1; KR_HK1_ID_SHA=$KR_HK1_IDENTITY_SHA
+  else [ "$KR_HK1_IDENTITY_SHA" = - ] || return 1; fi
+  if kr_ext_active; then
+    KEL_CURRENT=$(kr_ext_identity_current) || return 1
+    if [ "$KR_HK1" = 1 ]; then [ "$KEL_CURRENT" = "$KR_HK1_IDENTITY_SHA" ] || return 1
+    else [ "$KEL_CURRENT" = "$KR_SITE_IDENTITY_SHA" ] || return 1; fi
+    KR_EXT_ACTIVE=1
+  fi
+  return 0
+}
+kr_ext_legacy_known(){
+  # Exact path AND tag AND bytes are required; no generic service/parser bypass.
+  [ "${KR_EXT_ACTIVE:-0}" = 1 ] || return 1
+  case "${KR_SITE:-none}:${KR_HK1:-0}:$1:$2:$3" in
+    kh1:0:old-common:/usr/local/lib/earnapp-original.sh:7ad356a34a78c1bb8aa427bd9b7865d03b07b15999f101333bf177f8789e994f|\
+    kh1:0:old-watchdog:/usr/local/sbin/earnapp-watchdog:df79879efe5b5c1ab8e0951950e41498372d6103cab8a9661558766898982619|\
+    kh1:0:old-recover:/usr/local/sbin/earnapp-recover:7504edfb0bdcab58c91d95d2a7b5014d124a67f0c2cb493ffb3582f20cc04ae2|\
+    kh1:0:old-limit:/usr/local/sbin/earnapp-limit:4bd38f49d05190014e819fa9ba99f2ca2e8eabcae02828f4729cd3598a03c5f3|\
+    us6:0:old-recover:/usr/local/sbin/earnapp-recover:db7a91955273a7912ce7f7fbf1128f47ee1b0f7b73f7373068ef04fce9a974cb|\
+    us6:0:old-limit:/usr/local/sbin/earnapp-limit:c3a57e9b5c3333b015793b71117dce0848335c041ddeb36f5411fc5afb87afd5|\
+    none:1:old-common:/usr/local/lib/earnapp-original.sh:c4f06db679665639dc6e6bede7be31f9743ac943041f5861f5d2ee882c11cb80|\
+    none:1:old-watchdog:/usr/local/sbin/earnapp-watchdog:ef34020fb854b861b546ed865729582d69efcf236bbe91964a910e341017f90a|\
+    none:1:old-recover:/usr/local/sbin/earnapp-recover:3c4f6be23a5cfd36be5802d4f73fe3d0b2dee206afcb600b84e0230d953cc87a|\
+    none:1:old-limit:/usr/local/sbin/earnapp-limit:7d73699a7d93cd4620c877b89c863fecafae930f8426c5964347993f45fa8e7b) return 0;;
+  esac
+  return 1
+}
+kr_ext_source_init_valid(){
+  kr_ext_active || return 0
+  [ "$1" = /etc/init.d/earnapp ] || return 1
+  if [ "${KR_HK1:-0}" = 1 ]; then kr_hk1_source_guard
+  else kr_site_source_guard && (OLD_SVC=earnapp; suite_source_config_valid); fi
+}
+kr_ext_source_references(){
+  kr_ext_active || return 0
+  UPDATER_MAIN_SVC=earnapp
+  (OLD_SVC=earnapp; suite_source_config_valid) && suite_updater_guard /usr/bin/earnapp || return 1
+  for KER_FILE in /etc/init.d/* /etc/conf.d/* /etc/crontabs/* /etc/local.d/*.start /etc/crontab /etc/cron.d/*; do
+    [ -e "$KER_FILE" ] || [ -L "$KER_FILE" ] || continue
+    case "$KER_FILE" in
+      /etc/init.d/earnapp|/etc/conf.d/earnapp|/etc/local.d/earnapp-limit.start|\
+      /etc/init.d/earnapp_upgrader|/etc/init.d/earnapp-upgrader|/etc/conf.d/earnapp_upgrader|/etc/conf.d/earnapp-upgrader) continue;;
+      /etc/crontabs/root) kr_cron_filter check "$KER_FILE" >/dev/null || return 1; continue;;
+    esac
+    if grep -Eq '/usr/bin/earnapp|/usr/local/sbin/hk1-runtime|/usr/local/lib/earnapp-original|/usr/local/sbin/earnapp-(watchdog|recover|limit|kh1-bandwidth|us6-bandwidth)' "$KER_FILE"; then return 1; fi
+  done
+}
+kr_ext_source_worker(){ [ "${KR_HK1:-0}" = 1 ] || return 0; kr_hk1_source_worker; }
+kr_ext_source_absent(){ [ "${KR_HK1:-0}" = 1 ] || return 0; kr_hk1_source_absent; }
+kr_ext_hk_manifest(){
+  kr_hk1_topology_guard || return 1
+  for KEH_PATH in /usr/local/sbin/hk1-runtime/start /usr/local/sbin/hk1-runtime/bin/xray /usr/local/sbin/ea-stderr-counts; do
+    printf '%s %s %s\n' "$KEH_PATH" "$(hash_file "$KEH_PATH")" "$(stat -c '%d:%i:%u:%g:%a:%h' "$KEH_PATH")" || return 1
+  done
+  printf '/usr/local/sbin/hk1-runtime/loader/xray %s %s\n' "$(readlink /usr/local/sbin/hk1-runtime/loader/xray)" "$(stat -c '%u:%g' /usr/local/sbin/hk1-runtime/loader/xray)"
+}
+kr_ext_bw_meta(){
+  kr_plain_path "$KR_SITE_STATE" && [ -d "$KR_SITE_STATE" ] && [ "$(stat -c '%u:%g:%a' "$KR_SITE_STATE")" = 0:0:700 ] || return 1
+  for KEM_FILE in "$KR_SITE_STATE/inode" "$KR_SITE_STATE/status" "$KR_SITE_LOCK" "$KR_SITE_LOG" "$KR_SITE_LOG.1"; do
+    kr_plain_path "$KEM_FILE" && kr_plain "$KEM_FILE" || return 1
+    if [ -e "$KEM_FILE" ]; then [ "$(stat -c '%u:%g:%a:%h' "$KEM_FILE")" = 0:0:600:1 ] || return 1; fi
+  done
+  [ -f "$KR_SITE_STATE/inode" ] || return 1
+  KEM_CACHE=$(cat "$KR_SITE_STATE/inode") || return 1
+  case "$KEM_CACHE" in ''|0|*[!0-9]*) return 1;; esac
+}
+kr_ext_group_inode(){
+  [ "$#" = 2 ] || return 1
+  case "$2" in /openrc.earnapp|/openrc.xray-runtime) :;; *) return 1;; esac
+  KEG_PID=${1%%:*}; KEG_STAMP=$(process_stamp "$KEG_PID") || return 1
+  [ "${KEG_STAMP#*:}" = "${1#*:}" ] && [ "$(awk -F: '$1==0{print $3}' "/proc/$KEG_PID/cgroup")" = "$2" ] || return 1
+  KEG_INODE=$(stat -Lc %i "/sys/fs/cgroup$2") || return 1
+  [ "$(process_stamp "$KEG_PID")" = "$KEG_STAMP" ] || return 1
+  printf '%s\n' "$KEG_INODE"
+}
+kr_ext_bw_binding(){
+  KEB_NET=$(nft --debug=netlink -nn list table inet "$KR_SITE_TABLE" 2>&1) || return 1
+  KEB_WORDS=$(printf '%s\n' "$KEB_NET" | awk '
+    /^[ \t]*\[ socket load cgroupv2 => reg 1 \][ \t]*$/{if(p)bad=1;p=1;next}
+    p{if($0!~/^[ \t]*\[ cmp eq reg 1 0x[0-9a-fA-F]+ 0x[0-9a-fA-F]+ \][ \t]*$/||length($6)!=10||length($7)!=10)bad=1;else print $6,$7;p=0;n++}END{exit bad||p||n!=2}') || return 1
+  set -- $KEB_WORDS; [ "$#" = 4 ] || return 1
+  [ "$(printf '%u' "$2")" = 0 ] && [ "$(printf '%u' "$4")" = 0 ] && [ "$(printf '%u' "$1")" = "$(printf '%u' "$3")" ] || return 1
+  KEB_VALUE=$(printf '%u' "$1") && [ "$KEB_VALUE" != 0 ] && kr_site_validate_table "$KEB_VALUE" || return 1
+  printf '%s\n' "$KEB_VALUE"
+}
+kr_ext_note_binding(){
+  case "$1" in ''|0|*[!0-9]*) return 1;; esac
+  if [ -e "$KE_B/extension.bindings" ]; then kr_plain "$KE_B/extension.bindings" && [ "$(stat -c '%u:%a' "$KE_B/extension.bindings")" = 0:600 ] || return 1; fi
+  printf '%s\n' "$1" >>"$KE_B/extension.bindings" && chmod 600 "$KE_B/extension.bindings"
+}
+kr_ext_foreign_rate(){
+  [ "${KR_SITE:-none}" = kh1 ] || return 0
+  KEF_TABLES=$(nft list tables) || return 1
+  if printf '%s\n' "$KEF_TABLES" | grep -Fxq 'table inet earnapp_rate'; then
+    KEF_TEXT=$(nft -nn list table inet earnapp_rate) || return 1
+    printf '%s\n' "$KEF_TEXT" | kr_normalize_nft
+  else printf '%s\n' absent; fi
+}
+kr_ext_snapshot(){
+  kr_ext_settings >"$KE_B/sealed/extension.settings" || return 1
+  kr_ext_active || return 0
+  mkdir "$KE_B/sealed/extension" || return 1
+  if [ "${KR_HK1:-0}" = 1 ]; then kr_ext_hk_manifest >"$KE_B/sealed/extension/hk1.manifest" || return 1; fi
+  if [ "${KR_SITE:-none}" != none ]; then
+    kr_ext_bw_meta || return 1
+    KES_KEY=$(kr_source_worker) && KES_INODE=$(kr_ext_group_inode "$KES_KEY" /openrc.earnapp) || return 1
+    [ "$KEM_CACHE" = "$KES_INODE" ] && kr_site_validate_table "$KES_INODE" || return 1
+    kr_record_path "$KR_SITE_HELPER" || return 1
+    printf '%s\n' "$KES_INODE" >"$KE_B/sealed/extension/source.inode" || return 1
+    cp -p "$KR_SITE_STATE/inode" "$KE_B/sealed/extension/cache.inode" || return 1
+    nft -nn list table inet "$KR_SITE_TABLE" >"$KE_B/sealed/extension/bandwidth.nft" || return 1
+    kr_ext_foreign_rate >"$KE_B/sealed/extension/foreign-rate.nft" || return 1
+    kr_ext_note_binding "$KES_INODE" || return 1
+  fi
+}
+kr_ext_inject_init(){
+  awk -v hook="$2" '
+    /^start_pre\(\) \{$/{inside=1;n++;print;next}
+    inside&&/^  \[ -f \/etc\/earnapp\/registered /{print $0 " || return 1";guard++;next}
+    inside&&/^}$/{while((getline s<hook)>0)print "  "s;close(hook);inside=0;print;next}
+    {print}END{exit inside||n!=1||guard!=1}' "$1" >"$1.ext" && mv "$1.ext" "$1"
+}
+kr_ext_inject_recover(){
+  awk -v hook="$2" '
+    /rc-service "\$APP_SVC" start/&&/\|\| log FALLBACK_START_FAILED$/{s=$0;sub(/ *\|\| log FALLBACK_START_FAILED$/,"",s);print "if "s"; then";while((getline h<hook)>0)print h;close(hook);print "else log FALLBACK_START_FAILED; fi";fallback++;next}
+    /rc-service "\$APP_SVC" start/&&/\|\| \{ log START_FAILED; exit 1; \}$/{print;while((getline h<hook)>0)print h;close(hook);normal++;next}
+    {print}END{exit fallback!=1||normal!=1}' "$1" >"$1.ext" && mv "$1.ext" "$1"
+}
+kr_ext_inject_limit(){
+  awk -v helper="$2" '
+    /^trap /&&/PROBE/&&/rm -rf "\$d"/&&/ EXIT$/ {
+      print "site_limit_exit() {"
+      print "site_rc=$?; trap - EXIT"
+      print "[ \"$PROBE\" = 0 ] || nft delete table inet \"$T\" >/dev/null 2>&1"
+      print "rm -rf \"$d\""
+      print "if [ \"$site_rc\" = 0 ]; then "helper" apply || { log BANDWIDTH_REBIND_FAILED; site_rc=2; }; fi"
+      print "exit \"$site_rc\""
+      print "}"
+      print "trap site_limit_exit EXIT";n++;next
+    }{print}END{exit n!=1}' "$1" >"$1.ext" && mv "$1.ext" "$1"
+}
+kr_ext_emit_logger_runtime(){
+  cat <<'KE_LOGGER_RUNTIME'
+# HK1: one pinned stderr count logger is permitted alongside the owned SDK.
+hk1_owned_logger() (
+  [ "$#" = 3 ] && [ "$3" = /openrc.xray-runtime ] || exit 1
+  HP=$1; HW=$2; HG=$3
+  case "$HP:$HW" in *[!0-9:]*|:*|*:) exit 1;; esac
+  [ -f /usr/local/sbin/ea-stderr-counts ] && [ ! -L /usr/local/sbin/ea-stderr-counts ] &&
+    [ "$(stat -c '%u:%g:%a:%h' /usr/local/sbin/ea-stderr-counts)" = 0:0:700:1 ] &&
+    [ "$(hash_file /usr/local/sbin/ea-stderr-counts)" = 2de0e2bf9fee3e7377658ccc3f074d0f4c8004f4855b8c73e021e56601d21ec3 ] || exit 1
+  HS=$(process_stamp "$HP") && HWS=$(process_stamp "$HW") || exit 1
+  HX=$(readlink -f /bin/ash) && HPIPE=$(readlink "/proc/$HW/fd/2") || exit 1
+  case "$HPIPE" in pipe:\[*\]) :;; *) exit 1;; esac
+  HF=
+  for HD in /proc/[0-9]*; do
+    [ -d "$HD" ] || continue
+    od -An -v -t u1 "$HD/cmdline" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i==0)n++;if($i==10)bad=1}}END{exit !(n==2&&!bad)}' || continue
+    tr '\000' '\n' <"$HD/cmdline" | awk 'NR==1{if($0!="/bin/ash"&&$0!="/bin/sh")bad=1}NR==2{if($0!="/usr/local/sbin/ea-stderr-counts")bad=1}END{exit bad||NR!=2}' || continue
+    HL=${HD##*/}; HLS=$(process_stamp "$HL") || exit 1
+    [ "${HLS%%:*}" = "$HW" ] || continue
+    [ -z "$HF" ] && [ "$(readlink "$HD/exe")" = "$HX" ] &&
+      [ "$(readlink "$HD/fd/0")" = "$HPIPE" ] &&
+      [ "$(awk -F: '$1==0{print $3}' "$HD/cgroup")" = "$HG" ] || exit 1
+    [ ! -e "$HD/fd/9" ] && [ ! -L "$HD/fd/9" ] || exit 1
+    awk '/^Uid:/{ok=(NF==5&&$2==0&&$3==0&&$4==0&&$5==0)}END{exit !ok}' "$HD/status" || exit 1
+    [ "$(process_stamp "$HL")" = "$HLS" ] || exit 1
+    HF="$HL:${HLS#*:}"
+  done
+  [ -n "$HF" ] && [ "$(process_stamp "$HP")" = "$HS" ] && [ "$(process_stamp "$HW")" = "$HWS" ] || exit 1
+  printf '%s\n' "$HF"
+)
+KE_LOGGER_RUNTIME
+}
+kr_ext_inject_hk_limit(){
+  awk '
+    /^for m in \$v; do \[ "\$m" = "\$P" \] \|\| \[ "\$m" = "\$LIMIT_PARENT" \] \|\| return 1; done$/ {
+      print "HK_LOGGER=$(hk1_owned_logger \"$LIMIT_PARENT\" \"$P\" \"$G\") || return 1"
+      print "for m in $v; do [ \"$m\" = \"$P\" ] || [ \"$m\" = \"$LIMIT_PARENT\" ] || [ \"$m\" = \"${HK_LOGGER%%:*}\" ] || return 1; done"
+      print "[ \"$(hk1_owned_logger \"$LIMIT_PARENT\" \"$P\" \"$G\")\" = \"$HK_LOGGER\" ] || return 1";n++;next
+    }{print}END{exit n!=1}' "$1" >"$1.ext" && mv "$1.ext" "$1"
+}
+kr_ext_stage(){
+  kr_ext_active || return 0
+  if [ "${KR_HK1:-0}" = 1 ]; then
+    kr_hk1_init_logger >>"$KE_B/sealed/init" &&
+      kr_ext_emit_logger_runtime >>"$KE_B/sealed/helpers/common" &&
+      kr_ext_inject_hk_limit "$KE_B/sealed/helpers/limit" || return 1
+  fi
+  if [ "${KR_SITE:-none}" != none ]; then
+    mkdir "$KE_B/sealed/extension/canonical" "$KE_B/sealed/extension/rollback" || return 1
+    kr_site_stage "$KE_B/sealed/extension/canonical" earnapp /usr/bin/earnapp &&
+      kr_site_render "$KR_SITE_HELPER" "$KE_B/sealed/extension/rollback" source || return 1
+    kr_ext_inject_init "$KE_B/sealed/init" "$KE_B/sealed/extension/canonical/hook.init" &&
+      kr_ext_inject_recover "$KE_B/sealed/helpers/recover" "$KE_B/sealed/extension/canonical/hook.recover" &&
+      kr_ext_inject_limit "$KE_B/sealed/helpers/limit" "$KR_SITE_HELPER" || return 1
+    kr_plan "$KR_SITE_HELPER" "$KE_B/sealed/extension/canonical/helper" 700 || return 1
+  fi
+}
+kr_ext_baseline(){
+  kr_ext_active || return 0
+  if [ "${KR_HK1:-0}" = 1 ]; then
+    kr_ext_hk_manifest >"$KE_D/hk1.now" && cmp -s "$KE_D/hk1.now" "$KE_B/sealed/extension/hk1.manifest" || return 1
+  fi
+  if [ "${KR_SITE:-none}" != none ]; then
+    kr_ext_bw_meta && kr_site_validate_table "$(cat "$KE_B/sealed/extension/source.inode")" &&
+      [ "$KEM_CACHE" = "$(cat "$KE_B/sealed/extension/source.inode")" ] || return 1
+    kr_ext_foreign_rate >"$KE_D/foreign-rate.now" && cmp -s "$KE_D/foreign-rate.now" "$KE_B/sealed/extension/foreign-rate.nft" || return 1
+  fi
+}
+kr_ext_static(){
+  kr_ext_active || return 0
+  if [ "${KR_HK1:-0}" = 1 ]; then
+    kr_ext_hk_manifest >"$KE_D/hk1.now" && cmp -s "$KE_D/hk1.now" "$KE_B/sealed/extension/hk1.manifest" || return 1
+    KEC_KEY=$(kr_candidate_worker) && KEC_STAMP=$(process_stamp "${KEC_KEY%%:*}") || return 1
+    kr_hk1_logger_snapshot "${KEC_STAMP%%:*}" "${KEC_KEY%%:*}" /openrc.xray-runtime >/dev/null || return 1
+  fi
+  if [ "${KR_SITE:-none}" != none ]; then
+    KEC_KEY=$(kr_candidate_worker) && KEC_INODE=$(kr_ext_group_inode "$KEC_KEY" /openrc.xray-runtime) || return 1
+    kr_ext_bw_meta && [ "$KEM_CACHE" = "$KEC_INODE" ] && kr_site_validate_table "$KEC_INODE" || return 1
+    kr_ext_foreign_rate >"$KE_D/foreign-rate.now" && cmp -s "$KE_D/foreign-rate.now" "$KE_B/sealed/extension/foreign-rate.nft" || return 1
+  fi
+}
+kr_ext_before_stop(){ kr_ext_baseline; }
+kr_ext_after_start(){
+  kr_ext_active || return 0
+  if [ "${KR_SITE:-none}" != none ]; then
+    KES_KEY=$(kr_candidate_worker) && KES_INODE=$(kr_ext_group_inode "$KES_KEY" /openrc.xray-runtime) || return 1
+    kr_ext_note_binding "$KES_INODE" || return 1
+    "$KR_SITE_HELPER" apply 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+  fi
+  kr_ext_static
+}
+kr_ext_allowed(){
+  [ "${KR_SITE:-none}" != none ] && [ "$1" = "$KR_SITE_HELPER" ] || return 1
+  [ -f "$KE_B/sealed/extension/rollback/helper" ] &&
+    [ "$2" = "$(hash_file "$KE_B/sealed/extension/rollback/helper") 700" ]
+}
+kr_ext_restore_deferred(){ [ "${KR_SITE:-none}" != none ] && [ "$1" = "$KR_SITE_HELPER" ]; }
+kr_ext_before_restore(){
+  kr_ext_active || return 0
+  if [ "${KR_HK1:-0}" = 1 ]; then
+    kr_ext_hk_manifest >"$KE_D/hk1.now" && cmp -s "$KE_D/hk1.now" "$KE_B/sealed/extension/hk1.manifest" || return 1
+  fi
+  if [ "${KR_SITE:-none}" != none ]; then
+    KER_BOUND=$(kr_ext_bw_binding) || return 1
+    kr_plain "$KE_B/extension.bindings" || return 1
+    if ! grep -Fxq "$KER_BOUND" "$KE_B/extension.bindings"; then
+      # A start_pre can successfully submit a new binding before its worker is
+      # ready. Accept only its protected cache plus sealed known helper bytes
+      # and this transaction's startup/restore intent, never an arbitrary inode.
+      kr_ext_bw_meta && [ "$KEM_CACHE" = "$KER_BOUND" ] || return 1
+      KER_HELPER=$(kr_fingerprint "$KR_SITE_HELPER") || return 1
+      { [ "$KER_HELPER" = "$(hash_file "$KE_B/sealed/extension/canonical/helper") 700" ] ||
+        [ "$KER_HELPER" = "$(hash_file "$KE_B/sealed/extension/rollback/helper") 700" ]; } || return 1
+      { grep -Fxq START_CANONICAL "$KE_B/ledger" || [ "$(cat "$KE_B/phase")" = restoring ]; } || return 1
+      kr_ext_note_binding "$KER_BOUND" || return 1
+    fi
+    kr_ext_foreign_rate >"$KE_D/foreign-rate.now" && cmp -s "$KE_D/foreign-rate.now" "$KE_B/sealed/extension/foreign-rate.nft" || return 1
+    if grep -Fxq STOP_SOURCE "$KE_B/ledger"; then
+      kr_mutate "$KR_SITE_HELPER" "$KE_B/sealed/extension/rollback/helper" 700 || return 1
+    fi
+  fi
+}
+kr_ext_source_helper_snapshot(){
+  case "${KR_SITE:-none}" in kh1|us6) :;; *) return 1;; esac
+  # Re-derive the permitted tuple from code rather than trusting receipt fields.
+  KER_KNOWN=$(kr_site_select "$KR_SITE" && printf '%s %s %s\n' "$KR_SITE_HELPER" "$KR_SITE_HELPER_SHA" "$KR_SITE_SOURCE_MODE") || return 1
+  [ "$KER_KNOWN" = "$KR_SITE_HELPER $KR_SITE_HELPER_SHA $KR_SITE_SOURCE_MODE" ] || return 1
+  KER_ORIGINAL=$(kr_expected "$KR_SITE_HELPER" "$KE_B/sealed/snapshot.manifest") || return 1
+  [ "$KER_ORIGINAL" = "$KR_SITE_HELPER_SHA $KR_SITE_SOURCE_MODE" ] || return 1
+  [ "$(kr_fingerprint "$KE_B/sealed/files$KR_SITE_HELPER")" = "$KER_ORIGINAL" ] || return 1
+  printf '%s\n' "$KER_ORIGINAL"
+}
+kr_ext_restore_source_helper(){
+  [ "${KR_SITE:-none}" != none ] || return 0
+  KER_ORIGINAL=$(kr_ext_source_helper_snapshot) || return 1
+  kr_mutate "$KR_SITE_HELPER" "$KE_B/sealed/files$KR_SITE_HELPER" "${KER_ORIGINAL#* }"
+}
+kr_ext_after_source_restore(){
+  kr_ext_active || return 0
+  if [ "${KR_SITE:-none}" != none ]; then
+    KER_ORIGINAL=$(kr_ext_source_helper_snapshot) || return 1
+    KER_KEY=$(kr_source_worker) && KER_INODE=$(kr_ext_group_inode "$KER_KEY" /openrc.earnapp) || return 1
+    kr_ext_note_binding "$KER_INODE" || return 1
+    # On a retry the exact original helper may already have been restored; a
+    # verified current binding makes its apply path a counter-preserving no-op.
+    "$KR_SITE_HELPER" apply 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    kr_ext_bw_meta && [ "$KEM_CACHE" = "$KER_INODE" ] && kr_site_validate_table "$KER_INODE" || return 1
+    kr_ext_foreign_rate >"$KE_D/foreign-rate.now" && cmp -s "$KE_D/foreign-rate.now" "$KE_B/sealed/extension/foreign-rate.nft" || return 1
+    kr_ext_restore_source_helper || return 1
+  fi
+  if [ "${KR_HK1:-0}" = 1 ]; then kr_hk1_source_worker >/dev/null || return 1; fi
+}
+
+# Existing vendor updater ownership. Caller holds the setup locks before pause.
+# Only fixed vendor service names and pinned original SDK bytes are adoptable.
+ku_file(){
+  suite_source_plain_file "$1" && [ "$(stat -c %h "$1")" = 1 ]
+}
+ku_dir(){
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %u "$1")" = 0 ] || return 1
+  ku_mode=$(stat -c %a "$1") || return 1
+  [ "$((0$ku_mode & 022))" = 0 ]
+}
+ku_openrc_root(){
+  # Native OpenRC can create its root-owned state directory with group write.
+  # This exception is fixed to that directory; private receipts stay stricter.
+  [ "$#" = 0 ] && kr_plain_path /run/openrc && [ -d /run/openrc ] &&
+    [ "$(stat -c '%u:%g' /run/openrc)" = 0:0 ] || return 1
+  case "$(stat -c %a /run/openrc)" in 755|775) return 0;; *) return 1;; esac
+}
+ku_pending_path(){ printf '%s\n' "${KR_BACKUP_PREFIX}updaters.pending"; }
+ku_pending_read(){
+  KU_PENDING=$(ku_pending_path) || return 1
+  kr_plain_path "$KU_PENDING" && ku_dir "${KU_PENDING%/*}" && ku_file "$KU_PENDING" &&
+    [ "$(stat -c '%u:%g:%a:%h' "$KU_PENDING")" = 0:0:600:1 ] || return 1
+  awk -F= 'NR==1&&$1=="RECEIPT"&&NF==2{next} NR==2&&$1=="SEAL"&&NF==2{next} {bad=1} END{exit bad||NR!=2}' "$KU_PENDING" || return 1
+  KU_PENDING_RECEIPT=$(sed -n 's/^RECEIPT=//p' "$KU_PENDING") &&
+    KU_PENDING_SEAL=$(sed -n 's/^SEAL=//p' "$KU_PENDING") || return 1
+  case "$KU_PENDING_RECEIPT" in "${KR_BACKUP_PREFIX}updaters-"*) :;; *) return 1;; esac
+  valid_path "$KU_PENDING_RECEIPT" && kr_plain_path "$KU_PENDING_RECEIPT" && kr_hash_valid "$KU_PENDING_SEAL" || return 1
+  (KU_RECEIPT=$KU_PENDING_RECEIPT
+   ku_receipt_valid && [ "$(hash_file "$KU_RECEIPT/seal")" = "$KU_PENDING_SEAL" ])
+}
+ku_pending_compatible(){
+  KU_PENDING=$(ku_pending_path) || return 1
+  ! exists "$KU_PENDING" && return 0
+  ku_pending_read && [ "$KU_PENDING_RECEIPT" = "$KU_RECEIPT" ] &&
+    [ "$(hash_file "$KU_RECEIPT/seal")" = "$KU_PENDING_SEAL" ]
+}
+ku_pending_create(){
+  KU_PENDING=$(ku_pending_path) || return 1
+  kr_plain_path "$KU_PENDING" && ku_dir "${KU_PENDING%/*}" && ! exists "$KU_PENDING" || return 1
+  KU_PENDING_SEAL=$(hash_file "$KU_RECEIPT/seal") && kr_hash_valid "$KU_PENDING_SEAL" || return 1
+  # noclobber uses exclusive creation. A partial write after power loss is
+  # deliberately rejected on retry, never interpreted as an inactive updater.
+  (set -C; umask 077; printf 'RECEIPT=%s\nSEAL=%s\n' "$KU_RECEIPT" "$KU_PENDING_SEAL" > "$KU_PENDING") || return 1
+  sync && ku_pending_compatible
+}
+ku_pending_clear(){
+  KU_PENDING=$(ku_pending_path) || return 1
+  ! exists "$KU_PENDING" && return 0
+  ku_pending_compatible || return 1
+  KU_PENDING_FP=$(stat -c '%d:%i:%u:%g:%a:%h' "$KU_PENDING") &&
+    KU_PENDING_HASH=$(hash_file "$KU_PENDING") && ku_journal CLEAR_PENDING || return 1
+  [ "$(stat -c '%d:%i:%u:%g:%a:%h' "$KU_PENDING")" = "$KU_PENDING_FP" ] &&
+    [ "$(hash_file "$KU_PENDING")" = "$KU_PENDING_HASH" ] && rm "$KU_PENDING" && sync
+}
+kr_updaters_recover_pending(){
+  KU_PENDING=$(ku_pending_path) || return 1
+  ! exists "$KU_PENDING" && return 0
+  [ -z "${KU_RECEIPT:-}" ] && ku_pending_read || return 1
+  KU_RECEIPT=$KU_PENDING_RECEIPT
+  printf '%s\n' 'UPDATER_RECOVERY=restoring the sealed updater state before retry.'
+  kr_updaters_restore || return 1
+  KU_RECEIPT=; KU_COMMITTED=0
+}
+ku_fingerprint(){
+  if exists "$1"; then
+    ku_file "$1" || return 1
+    ku_hash=$(hash_file "$1") && ku_meta=$(stat -c '%a:%u:%g:%h' "$1") || return 1
+    printf '%s %s\n' "$ku_hash" "$ku_meta"
+  else printf '%s\n' '- -'; fi
+}
+ku_state() (
+  # Core OpenRC state only: never execute an init status hook during a probe.
+  [ "${RC_SVCDIR:-/run/openrc}" = /run/openrc ] && ku_openrc_root || exit 1
+  ku_started=0
+  for ku_flag in started starting stopping inactive failed hotplugged coldplugged wasinactive scheduled; do
+    ku_path=/run/openrc/$ku_flag
+    ! exists "$ku_path" || ku_dir "$ku_path" || exit 1
+    if exists "$ku_path/$1"; then
+      [ "$ku_flag" = started ] || exit 1
+      ku_started=1
+    fi
+  done
+  for ku_path in /run/openrc/scheduled/*/"$1"; do ! exists "$ku_path" || exit 1; done
+  if [ "$ku_started" = 1 ]; then printf 'active\n'; exit 0; fi
+  ku_helper=
+  for ku_path in /usr/libexec/rc/bin/service_stopped /lib/rc/bin/service_stopped /usr/lib/rc/bin/service_stopped; do
+    [ ! -x "$ku_path" ] || { ku_helper=$ku_path; break; }
+  done
+  [ -n "$ku_helper" ] || ku_helper=$(command -v service_stopped) || exit 1
+  ku_helper=$(readlink -f "$ku_helper") && ku_file "$ku_helper" || exit 1
+  RC_SVCNAME=$1 timeout -k 2 10 "$ku_helper" "$1" 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || exit 1
+  printf 'stopped\n'
+)
+ku_levels() (
+  ku_dir /etc/runlevels || exit 1
+  for ku_path in /etc/runlevels/*/"$1"; do
+    exists "$ku_path" || continue
+    ku_level=${ku_path%/*}; ku_level=${ku_level##*/}
+    valid_name "$ku_level" && ku_dir "/etc/runlevels/$ku_level" && [ -L "$ku_path" ] &&
+      [ "$(stat -c '%u:%g' "$ku_path")" = 0:0 ] && [ "$(readlink "$ku_path")" = "/etc/init.d/$1" ] || exit 1
+    printf '%s\n' "$ku_level"
+  done
+)
+ku_meta(){ suite_updater_meta_value "$@" 5>&- 6>&- 7>&- 8>&- 9>&-; }
+ku_inactive_metadata() (
+  ku_child=$(ku_meta "$1" child_pid) && ku_path=$(ku_meta "$1" pidfile) || exit 1
+  case "$ku_child" in ''|0) :;; *[!0-9]*) exit 1;; *) [ "$ku_child" -gt 1 ] && [ ! -d "/proc/$ku_child" ] || exit 1;; esac
+  [ -n "$ku_path" ] || exit 0
+  case "$ku_path" in "/var/run/supervise-$1.pid"|"/run/supervise-$1.pid") :;; *) exit 1;; esac
+  if exists "$ku_path"; then
+    ku_file "$ku_path" && ku_parent=$(cat "$ku_path") || exit 1
+    case "$ku_parent" in ''|*[!0-9]*) exit 1;; esac
+    [ "$ku_parent" -gt 1 ] && [ ! -d "/proc/$ku_parent" ] || exit 1
+  fi
+)
+ku_literal(){
+  ku_file "/etc/init.d/$1" && ku_dir /etc/init.d && ku_dir /etc/conf.d || return 1
+  # Normalize only one exact literal, then use the established transparent parser.
+  awk '/^[[:space:]]*command_args=/{
+    s=$0;sub(/^[[:space:]]*command_args=/,"",s);sub(/[[:space:]]+$/,"",s)
+    if(s=="autoupgrade" || s=="\"autoupgrade\"" || s==sprintf("%cautoupgrade%c",39,39)){
+      n++;print "command_args=\"run\"";next}
+  }{print} END{exit n!=1}' "/etc/init.d/$1" > "$KU_PROBE/validation-init" || return 1
+  chmod 755 "$KU_PROBE/validation-init" || return 1
+  (SDK_BIN=/usr/bin/earnapp; OLD_SVC=$1
+   suite_source_init_valid "$KU_PROBE/validation-init" && suite_source_config_valid)
+}
+ku_argv() (
+  # Preserve the loader grammar, including gcompat options, rather than assuming
+  # argv[1] is the SDK. The old parser receives only the normalized purpose token.
+  ku_argv_dir=$(mktemp -d "$KU_PROBE/argv-$1-XXXXXXXX") || exit 1
+  tr '\000' '\n' < "/proc/$1/cmdline" | awk '
+    $0=="autoupgrade"{$0="run";n++}{printf "%s%c",$0,0} END{exit n!=1}' > "$ku_argv_dir/cmdline" || exit 1
+  ku_exe=$(readlink "/proc/$1/exe") && ln -s "$ku_exe" "$ku_argv_dir/exe" || exit 1
+  NUG_SDK=/usr/bin/earnapp; NUG_CANON=$(readlink -f "$NUG_SDK") || exit 1
+  suite_updater_run_argv "$ku_argv_dir"
+)
+ku_key() (
+  ku_service=$1
+  ku_pids=$(service_worker_pids "$ku_service" /usr/bin/earnapp 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || exit 1
+  set -- $ku_pids; [ "$#" = 1 ] || exit 1
+  ku_pid=$1; ku_stamp=$(process_stamp "$ku_pid") || exit 1
+  ku_parent=${ku_stamp%%:*}; ku_parent_stamp=$(process_stamp "$ku_parent") || exit 1
+  [ "$(ku_meta "$ku_service" child_pid)" = "$ku_pid" ] || exit 1
+  ku_pidfile=$(ku_meta "$ku_service" pidfile) || exit 1
+  case "$ku_pidfile" in "/var/run/supervise-$ku_service.pid"|"/run/supervise-$ku_service.pid") :;; *) exit 1;; esac
+  ku_file "$ku_pidfile" && [ "$(cat "$ku_pidfile")" = "$ku_parent" ] || exit 1
+  ku_sup=$(command -v supervise-daemon) && ku_sup=$(readlink -f "$ku_sup") && ku_file "$ku_sup" || exit 1
+  [ "$(readlink "/proc/$ku_parent/exe")" = "$ku_sup" ] || exit 1
+  ku_suphash=$(hash_file "$ku_sup") && [ "$(hash_file "/proc/$ku_parent/exe")" = "$ku_suphash" ] || exit 1
+  tr '\000' '\n' < "/proc/$ku_parent/cmdline" | awk -v s="$ku_service" 'NR==2{ok=($0==s)} END{exit !ok}' || exit 1
+  for ku_check in "$ku_pid" "$ku_parent"; do
+    awk '/^Uid:/{ok=(NF==5&&$2==0&&$3==0&&$4==0&&$5==0)} END{exit !ok}' "/proc/$ku_check/status" || exit 1
+  done
+  ku_exe=$(readlink "/proc/$ku_pid/exe") || exit 1
+  case "$ku_exe" in *' (deleted)') exit 1;; esac
+  ku_exe=$(readlink -f "$ku_exe") && ku_file "$ku_exe" || exit 1
+  ku_exehash=$(hash_file "$ku_exe") && [ "$(hash_file "/proc/$ku_pid/exe")" = "$ku_exehash" ] || exit 1
+  ku_argv "$ku_pid" || exit 1
+  [ "$(awk -F: '$1==0{print $3}' "/proc/$ku_pid/cgroup")" = "/openrc.$ku_service" ] || exit 1
+  [ "$(ku_meta "$ku_service" child_pid)" = "$ku_pid" ] &&
+    [ "$(ku_meta "$ku_service" pidfile)" = "$ku_pidfile" ] && [ "$(cat "$ku_pidfile")" = "$ku_parent" ] &&
+    [ "$(process_stamp "$ku_pid")" = "$ku_stamp" ] && [ "$(process_stamp "$ku_parent")" = "$ku_parent_stamp" ] || exit 1
+  printf '%s %s %s %s %s\n' "$ku_pid" "$ku_stamp" "$ku_parent_stamp" "$ku_exehash" "$ku_suphash"
+)
+ku_identity() (
+  ku_file /usr/bin/earnapp && ku_hash=$(hash_file /usr/bin/earnapp) && kr_sdk_source_hash_valid "$ku_hash" || exit 1
+  printf 'SDK %s\n' "$ku_hash"
+  for ku_path in /etc/machine-id /var/lib/dbus/machine-id /etc/earnapp/uuid /etc/earnapp/registered; do
+    if exists "$ku_path"; then
+      [ -f "$ku_path" ] && [ -r "$ku_path" ] || exit 1
+      printf '%s %s %s\n' "$ku_path" "$(hash_file "$ku_path")" "$(stat -c '%a:%u:%g' "$ku_path")"
+    else printf '%s absent\n' "$ku_path"; fi
+  done
+  ku_id=$(timeout -k 2 15 /usr/bin/earnapp showid 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || exit 1
+  printf '%s\n' "$ku_id" | awk 'NR==1&&/^sdk-node-[0-9a-f]+$/&&length($0)==41{ok=1} END{exit !(ok&&NR==1)}' || exit 1
+  ku_digest=$(printf '%s' "$ku_id" | sha256sum) || exit 1
+  printf 'DEVICE_SHA256 %s\n' "${ku_digest%% *}"
+)
+ku_processes() (
+  NUG_SDK=/usr/bin/earnapp; NUG_CANON=$(readlink -f "$NUG_SDK"); NUG_HASH=$(hash_file "$NUG_SDK") || exit 1
+  NSP_CANON=$NUG_CANON; NSP_HASH=$NUG_HASH
+  ku_main=$(suite_updater_main_key 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || ku_main=
+  ku_sup=$(command -v supervise-daemon) && ku_sup=$(readlink -f "$ku_sup") || exit 1
+  for ku_proc in /proc/[0-9]*; do
+    [ -d "$ku_proc" ] || continue
+    ku_pid=${ku_proc##*/}; ku_match=0
+    suite_source_program "$ku_proc" || ku_match=$?
+    case "$ku_match" in
+      0)
+        ku_stamp=$(process_stamp "$ku_pid") || exit 1
+        if awk -v p="$ku_pid" '$1==p{found=1} END{exit !found}' "$KU_PROBE/keys"; then :
+        else
+          [ "$ku_pid:$ku_stamp" = "$ku_main" ] && suite_updater_run_argv "$ku_proc" || exit 1
+        fi;;
+      1) :;; *) exit 1;;
+    esac
+    ku_args=$(tr '\000' '\n' < "$ku_proc/cmdline" 2>/dev/null) || { [ ! -d "$ku_proc" ] && continue; exit 1; }
+    if printf '%s\n' "$ku_args" | awk '/(^|[^A-Za-z0-9_.-])earnapp[_-]upgrader([^A-Za-z0-9_.-]|$)/{f=1} END{exit !f}'; then
+      awk -v p="$ku_pid" '$1==p || $2 ~ ("^"p":"){f=1} END{exit !f}' "$KU_PROBE/keys" || exit 1
+      [ "$(readlink "$ku_proc/exe")" = "$ku_sup" ] || exit 1
+    fi
+  done
+)
+ku_main_profile(){
+  KU_MAIN_SERVICE=earnapp; KU_MAIN_PROGRAM=/usr/bin/earnapp; KU_MAIN_NAMED=0
+  ! exists "$NAMING_REGISTRY" && return 0
+  # Only the sealed, active historical naming transaction may identify this
+  # fixed alias as the main SDK. A path or a matching process name is not proof.
+  (exec 5>&- 6>&- 7>&- 8>&- 9>&-
+   kr_plain_path "$NAMING_REGISTRY" && ku_file "$NAMING_REGISTRY" || exit 1
+   U_B=$(cat "$NAMING_REGISTRY") && valid_path "$U_B" && kr_plain_path "$U_B" && ku_dir "$U_B" || exit 1
+   ku_dir "$U_B/files" && kr_plain_path "$U_B/files" || exit 1
+   for ku_receipt_file in naming.metadata naming.settings alias.manifest owned naming.state files.manifest files/registry; do
+     kr_plain_path "$U_B/$ku_receipt_file" && ku_file "$U_B/$ku_receipt_file" || exit 1
+   done
+   [ "$MAIN_SERVICE" = kaleno ] && [ "$MAIN_PROGRAM" = /usr/local/lib/vesari ] || exit 1
+   naming_load && [ "$N_CURRENT_VERSION" = "$NAMING_VERSION" ] &&
+     [ "$(cat "$U_B/naming.state")" = active ] && [ "$N_SOURCE" = /usr/bin/earnapp ] &&
+     kr_sdk_source_hash_valid "$N_HASH" && naming_check_originals && naming_check_aliases 1 && suite_check_owned "$U_B" || exit 1
+   ku_file /usr/bin/earnapp && ku_file "$MAIN_PROGRAM" &&
+     [ "$(hash_file /usr/bin/earnapp)" = "$N_HASH" ] && [ "$(hash_file "$MAIN_PROGRAM")" = "$N_HASH" ]) || return 1
+  KU_MAIN_SERVICE=kaleno; KU_MAIN_PROGRAM=/usr/local/lib/vesari; KU_MAIN_NAMED=1
+}
+ku_named_original_absent() (
+  # The alias guard checks the main worker. Separately reject any payload still
+  # using the original path, including an orphan without updater metadata.
+  NSP_CANON=$(readlink -f /usr/bin/earnapp) && NSP_HASH=$(hash_file /usr/bin/earnapp) || exit 1
+  for ku_proc in /proc/[0-9]*; do
+    [ -d "$ku_proc" ] || continue
+    ku_match=0; suite_source_program "$ku_proc" || ku_match=$?
+    [ "$ku_match" = 1 ] || exit 1
+  done
+)
+kr_updaters_probe(){
+  KU_MODE=unknown; KU_ACTIVE=
+  KU_PENDING=$(ku_pending_path) || return 1
+  if exists "$KU_PENDING"; then
+    if [ -z "${KU_PENDING_ALLOWED:-}" ] || [ "$KU_PENDING_ALLOWED" != "${KU_RECEIPT:-}" ] || ! ku_pending_compatible; then
+      printf '%s\n' 'UPDATER_RECOVERY_REQUIRED=owned pending receipt must be validated and restored before installation.' >&2
+      return 1
+    fi
+  fi
+  ku_main_profile || return 1
+  if [ "$KU_MAIN_NAMED" = 1 ]; then
+    ku_named_original_absent || return 1
+    UPDATER_MAIN_SVC=$KU_MAIN_SERVICE suite_updater_guard "$KU_MAIN_PROGRAM" 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || {
+      printf '%s\n' 'UPDATER_STATE=unknown; named source updater was retained without stopping.' >&2; return 1;
+    }
+    KU_MODE=inactive; return 0
+  fi
+  if UPDATER_MAIN_SVC=$KU_MAIN_SERVICE suite_updater_guard "$KU_MAIN_PROGRAM" 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1; then KU_MODE=inactive; return 0; fi
+  ku_dir "$KE_D" && [ "$(stat -c %a "$KE_D")" = 700 ] || return 1
+  KU_PROBE=$(mktemp -d "$KE_D/updater-probe-XXXXXXXX") || return 1
+  : > "$KU_PROBE/services"; : > "$KU_PROBE/manifest"; : > "$KU_PROBE/keys"
+  ku_identity > "$KU_PROBE/identity" && suite_updater_references || return 1
+  for KU_S in earnapp_upgrader earnapp-upgrader; do
+    for KU_P in "/etc/systemd/system/$KU_S.service" "/usr/lib/systemd/system/$KU_S.service" "/lib/systemd/system/$KU_S.service"; do
+      ! exists "$KU_P" || { ku_file "$KU_P" && suite_updater_systemd_inactive; } || return 1
+    done
+    KU_STATE=$(ku_state "$KU_S") || return 1
+    if ! exists "/etc/init.d/$KU_S"; then
+      [ "$KU_STATE" = stopped ] && [ -z "$(ku_levels "$KU_S")" ] && ku_inactive_metadata "$KU_S" || return 1
+      continue
+    fi
+    ku_literal "$KU_S" || return 1
+    printf '%s\n' "$KU_S" >> "$KU_PROBE/services"
+    printf '%s\n' "$KU_STATE" > "$KU_PROBE/$KU_S.state"
+    ku_levels "$KU_S" > "$KU_PROBE/$KU_S.levels" || return 1
+    for KU_P in "/etc/init.d/$KU_S" "/etc/conf.d/$KU_S"; do
+      KU_FP=$(ku_fingerprint "$KU_P") || return 1
+      printf '%s %s\n' "$KU_P" "$KU_FP" >> "$KU_PROBE/manifest"
+    done
+    if [ "$KU_STATE" = active ]; then
+      KU_KEY=$(ku_key "$KU_S") || return 1
+      printf '%s\n' "$KU_KEY" > "$KU_PROBE/$KU_S.key"; printf '%s\n' "$KU_KEY" >> "$KU_PROBE/keys"
+      KU_ACTIVE=${KU_ACTIVE:+$KU_ACTIVE }$KU_S
+    else ku_inactive_metadata "$KU_S" && : > "$KU_PROBE/$KU_S.key" || return 1; fi
+  done
+  [ -s "$KU_PROBE/services" ] && ku_processes || return 1
+  ku_identity > "$KU_PROBE/identity.now" && cmp -s "$KU_PROBE/identity" "$KU_PROBE/identity.now" || return 1
+  while IFS= read -r KU_S; do
+    [ "$(ku_state "$KU_S")" = "$(cat "$KU_PROBE/$KU_S.state")" ] || return 1
+    ku_levels "$KU_S" > "$KU_PROBE/levels.now" && cmp -s "$KU_PROBE/levels.now" "$KU_PROBE/$KU_S.levels" || return 1
+    if [ -s "$KU_PROBE/$KU_S.key" ]; then [ "$(ku_key "$KU_S")" = "$(cat "$KU_PROBE/$KU_S.key")" ] || return 1
+    else ku_inactive_metadata "$KU_S" || return 1; fi
+  done < "$KU_PROBE/services"
+  while read -r KU_P KU_H KU_M; do [ "$(ku_fingerprint "$KU_P")" = "$KU_H $KU_M" ] || return 1; done < "$KU_PROBE/manifest"
+  KU_MODE=owned
+}
+ku_receipt_valid(){
+  ku_dir "$KU_RECEIPT" && [ "$(stat -c %a "$KU_RECEIPT")" = 700 ] && ku_dir "$KU_RECEIPT/sealed" || return 1
+  ku_file "$KU_RECEIPT/seal" && ku_file "$KU_RECEIPT/ledger" && ku_file "$KU_RECEIPT/phase" || return 1
+  (cd "$KU_RECEIPT/sealed" && sha256sum -c ../seal >/dev/null 2>&1) || return 1
+  while IFS= read -r ku_s; do case "$ku_s" in earnapp_upgrader|earnapp-upgrader) :;; *) return 1;; esac; done < "$KU_RECEIPT/sealed/services"
+}
+ku_static_match(){
+  while read -r ku_p ku_h ku_m; do [ "$(ku_fingerprint "$ku_p")" = "$ku_h $ku_m" ] || return 1; done < "$KU_RECEIPT/sealed/manifest"
+}
+ku_files_match(){
+  ku_static_match || return 1
+  ku_identity > "$KE_D/updater-identity.now" && cmp -s "$KE_D/updater-identity.now" "$KU_RECEIPT/sealed/identity"
+}
+ku_journal(){ printf '%s\n' "$*" >> "$KU_RECEIPT/ledger" && sync; }
+kr_updaters_pause(){
+  KU_COMMITTED=0
+  [ -z "${KU_RECEIPT:-}" ] || return 1
+  kr_updaters_probe || return 1
+  [ "$KU_MODE" != inactive ] || return 0
+  kr_backup_parent || return 1
+  KU_RECEIPT=$(mktemp -d "${KR_BACKUP_PREFIX}updaters-XXXXXXXX") || return 1
+  chmod 700 "$KU_RECEIPT" && mkdir "$KU_RECEIPT/sealed" && chmod 700 "$KU_RECEIPT/sealed" || return 1
+  : > "$KU_RECEIPT/ledger"; printf 'preparing\n' > "$KU_RECEIPT/phase"
+  cp "$KU_PROBE/services" "$KU_PROBE/manifest" "$KU_PROBE/identity" "$KU_RECEIPT/sealed/" || return 1
+  while IFS= read -r KU_S; do
+    cp "$KU_PROBE/$KU_S.state" "$KU_PROBE/$KU_S.levels" "$KU_PROBE/$KU_S.key" "$KU_RECEIPT/sealed/" &&
+      cp -p "/etc/init.d/$KU_S" "$KU_RECEIPT/sealed/$KU_S.init" || return 1
+    ! exists "/etc/conf.d/$KU_S" || cp -p "/etc/conf.d/$KU_S" "$KU_RECEIPT/sealed/$KU_S.conf" || return 1
+  done < "$KU_RECEIPT/sealed/services"
+  (cd "$KU_RECEIPT/sealed" && sha256sum ./* > ../seal) && chmod 600 "$KU_RECEIPT/seal" "$KU_RECEIPT/ledger" "$KU_RECEIPT/phase" || return 1
+  ku_receipt_valid && ku_files_match && ku_journal SEALED && ku_pending_create || return 1
+  printf 'pausing\n' > "$KU_RECEIPT/phase"
+  while IFS= read -r KU_S; do
+    ku_levels "$KU_S" > "$KE_D/updater-levels.now" && cmp -s "$KE_D/updater-levels.now" "$KU_RECEIPT/sealed/$KU_S.levels" || return 1
+    if [ "$(cat "$KU_RECEIPT/sealed/$KU_S.state")" = active ]; then
+      ku_files_match || return 1
+      KU_CHECK=$(ku_key "$KU_S") || return 1
+      [ "$KU_CHECK" = "$(cat "$KU_RECEIPT/sealed/$KU_S.key")" ] && ku_journal STOP "$KU_S" || return 1
+      [ "$(ku_key "$KU_S")" = "$KU_CHECK" ] && ku_static_match || return 1
+      timeout -k 5 30 rc-service "$KU_S" stop 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    fi
+    [ "$(ku_state "$KU_S")" = stopped ] || return 1
+    read -r KU_PID KU_STAMP KU_REST < "$KU_RECEIPT/sealed/$KU_S.key" || KU_PID=
+    [ -z "$KU_PID" ] || { [ ! -d "/proc/$KU_PID" ] && [ ! -d "/proc/${KU_STAMP%%:*}" ]; } || return 1
+    while IFS= read -r KU_L; do
+      ku_files_match && ku_journal DISABLE "$KU_S" "$KU_L" || return 1
+      ku_levels "$KU_S" > "$KE_D/updater-levels.now" && grep -Fxq "$KU_L" "$KE_D/updater-levels.now" || return 1
+      ku_static_match || return 1
+      rc-update del "$KU_S" "$KU_L" 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+      ! exists "/etc/runlevels/$KU_L/$KU_S" || return 1
+    done < "$KU_RECEIPT/sealed/$KU_S.levels"
+  done < "$KU_RECEIPT/sealed/services"
+  suite_updater_guard /usr/bin/earnapp 5>&- 6>&- 7>&- 8>&- 9>&- && ku_files_match || return 1
+  printf 'paused\n' > "$KU_RECEIPT/phase" && ku_journal PAUSED
+}
+kr_updaters_restore(){
+  [ -z "${KU_RECEIPT:-}" ] && return 0
+  ku_receipt_valid && ku_pending_compatible && ku_files_match || return 1
+  case "$(cat "$KU_RECEIPT/phase")" in preparing|pausing|paused|restoring|restored|committed) :;; *) return 1;; esac
+  # Includes orphan/extra SDK payloads and supervisor metadata, even if OpenRC
+  # currently reports stopped. Never start over an unproved leftover process.
+  KU_PENDING_ALLOWED=$KU_RECEIPT kr_updaters_probe || return 1
+  # Prevalidate every current entry before restoring any captured activation.
+  while IFS= read -r KU_S; do
+    KU_LEVELS=$(ku_levels "$KU_S") || return 1
+    for KU_L in $KU_LEVELS; do grep -Fxq "$KU_L" "$KU_RECEIPT/sealed/$KU_S.levels" || return 1; done
+    KU_STATE=$(ku_state "$KU_S") || return 1
+    if [ "$KU_STATE" = active ]; then
+      [ "$(cat "$KU_RECEIPT/sealed/$KU_S.state")" = active ] || return 1
+    fi
+  done < "$KU_RECEIPT/sealed/services"
+  printf 'restoring\n' > "$KU_RECEIPT/phase"
+  while IFS= read -r KU_S; do
+    while IFS= read -r KU_L; do
+      if ! exists "/etc/runlevels/$KU_L/$KU_S"; then
+        ku_files_match && ku_journal RESTORE_LEVEL "$KU_S" "$KU_L" || return 1
+        ! exists "/etc/runlevels/$KU_L/$KU_S" && ku_static_match || return 1
+        rc-update add "$KU_S" "$KU_L" 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+      fi
+    done < "$KU_RECEIPT/sealed/$KU_S.levels"
+    if [ "$(cat "$KU_RECEIPT/sealed/$KU_S.state")" = active ] && [ "$(ku_state "$KU_S")" = stopped ]; then
+      ku_files_match && ku_journal RESTART "$KU_S" || return 1
+      ku_static_match && [ "$(ku_state "$KU_S")" = stopped ] && ku_inactive_metadata "$KU_S" || return 1
+      timeout -k 5 30 rc-service "$KU_S" start 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || return 1
+    fi
+  done < "$KU_RECEIPT/sealed/services"
+  KU_PENDING_ALLOWED=$KU_RECEIPT kr_updaters_probe && [ "$KU_MODE" = owned ] && ku_files_match || return 1
+  while IFS= read -r KU_S; do
+    [ "$(ku_state "$KU_S")" = "$(cat "$KU_RECEIPT/sealed/$KU_S.state")" ] &&
+      ku_levels "$KU_S" > "$KE_D/updater-levels.now" && cmp -s "$KE_D/updater-levels.now" "$KU_RECEIPT/sealed/$KU_S.levels" || return 1
+  done < "$KU_RECEIPT/sealed/services"
+  printf 'restored\n' > "$KU_RECEIPT/phase" && ku_journal RESTORED && ku_pending_clear
+}
+kr_updaters_commit(){
+  [ -z "${KU_RECEIPT:-}" ] && return 0
+  ku_receipt_valid && ku_pending_compatible && ku_files_match && suite_updater_guard /usr/bin/earnapp 5>&- 6>&- 7>&- 8>&- 9>&- || return 1
+  while IFS= read -r KU_S; do [ -z "$(ku_levels "$KU_S")" ] && [ "$(ku_state "$KU_S")" = stopped ] || return 1; done < "$KU_RECEIPT/sealed/services"
+  ku_journal COMMIT && printf 'committed\n' > "$KU_RECEIPT/phase" && ku_pending_clear || return 1
+  KU_COMMITTED=1
+}
+
 # Unified transaction engine. Staging never invokes a legacy installer.
 # All receipts are private root-owned records; identity values are hashes only.
-kr_error(){ printf 'FAIL: %s\n' "$*" >&2; return 1; }
+kr_error(){ kr_redact_message "FAIL: EarnApp maintenance: $*" >&2; return 1; }
 kr_hash_valid(){ case "$1" in ''|*[!0-9a-f]*) return 1;; esac; [ "${#1}" = 64 ]; }
 kr_plain(){ suite_regular "$1" || return 1; ! exists "$1" || [ "$(stat -c %h "$1")" = 1 ]; }
 kr_fingerprint(){
@@ -3144,6 +4832,7 @@ kr_allowed(){
   [ "$KA_NOW" = "$KA_OLD" ] && return 0
   KA_PLAN=$(kr_expected "$1" "$KE_B/sealed/plan.manifest" 2>/dev/null) || KA_PLAN=
   [ "$KA_NOW" = "$KA_PLAN" ] && return 0
+  kr_ext_allowed "$1" "$KA_NOW" && return 0
   if [ "$1" = /etc/crontabs/root ]; then
     [ "$KA_NOW" = "$(hash_file "$KE_B/sealed/cron.paused") 600" ] && return 0
     [ "$KA_NOW" = "$(hash_file "$KE_B/sealed/cron.final") 600" ] && return 0
@@ -3192,7 +4881,8 @@ kr_mkdir(){
 }
 kr_cron_filter(){
   awk -v mode="$1" '
-  function owned(s){return s=="*/2 * * * * /usr/local/sbin/earnapp-watchdog >/dev/null 2>&1 # EARNAPP-WATCHDOG" ||
+  function owned(s){return s=="0 0,12 * * * /sbin/rc-service earnapp stop >/dev/null 2>&1; /bin/sleep 5; /sbin/rc-service earnapp start >/dev/null 2>&1; /bin/sleep 3; /usr/local/sbin/earnapp-limit 20 >/dev/null 2>&1 # EARNAPP-12H-STOPSTART" ||
+   s=="*/2 * * * * /usr/local/sbin/earnapp-watchdog >/dev/null 2>&1 # EARNAPP-WATCHDOG" ||
    s=="0 */12 * * * /usr/local/sbin/earnapp-recover scheduled >/dev/null 2>&1 # EARNAPP-12H-STOPSTART" ||
    s=="*/2 * * * * /usr/local/sbin/selnu >/dev/null 2>&1 # EARNAPP-MAINT-WATCHDOG" ||
    s=="0 */12 * * * /usr/local/sbin/tavik scheduled >/dev/null 2>&1 # EARNAPP-MAINT-RECOVERY" ||
@@ -3226,15 +4916,19 @@ kr_identity_manifest(){
 }
 kr_source_id(){
   KI_PROGRAM=$KE_SOURCE_PROGRAM
+  if [ "${KR_HK1:-0}" = 1 ] && [ "$KI_PROGRAM" != "$KR_PROGRAM" ]; then KI_PROGRAM=$KE_ORIGINAL; fi
   if ! exists "$KI_PROGRAM" && [ -f "${KE_B:-}/sealed/identity.manifest" ]; then
     KI_ORIGINAL_HASH=$(awk -v p="$KE_ORIGINAL" '$1=="ORIGINAL_SDK"&&$2==p{print $3}' "$KE_B/sealed/identity.manifest") || return 1
     [ "$(hash_file "$KE_ORIGINAL")" = "$KI_ORIGINAL_HASH" ] || return 1
     KI_PROGRAM=$KE_ORIGINAL
   fi
-  if [ "$KI_PROGRAM" = "$KR_PROGRAM" ]; then KI_RAW=$(kr_sdk "$KR_PROGRAM" showid 2>/dev/null) || return 1
-  else KI_RAW=$(timeout -k 2 15 "$KI_PROGRAM" showid 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || return 1; fi
-  printf '%s\n' "$KI_RAW" | awk 'NR==1&&/^sdk-node-[0-9a-f]+$/&&length($0)==41{ok=1} END{exit !(ok&&NR==1)}' || return 1
-  printf '%s\n' "$KI_RAW"
+  KI_RC=0
+  if [ "$KI_PROGRAM" = "$KR_PROGRAM" ]; then KI_RAW=$(kr_sdk "$KR_PROGRAM" showid 2>&1) || KI_RC=$?
+  else KI_RAW=$(timeout -k 2 15 "$KI_PROGRAM" showid 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1) || KI_RC=$?; fi
+  if [ "$KI_RC" != 0 ] && [ "$KI_PROGRAM" != "$KR_PROGRAM" ]; then
+    KI_RAW=$(kr_sdk_private_query "$KE_ORIGINAL" showid 2>&1) || return 1
+  elif [ "$KI_RC" != 0 ]; then return 1; fi
+  printf '%s\n' "$KI_RAW" | sed "s/$(printf '\033')\[[0-9;]*[[:alpha:]]//g;s/$(printf '\r')//g" | awk '/^sdk-node-[0-9a-f]+$/&&length($0)==41{id=$0;n++} END{if(n!=1)exit 1;print id}'
 }
 kr_identity_check(){
   kr_identity_manifest "$KE_D/identity.now" || return 1
@@ -3244,10 +4938,37 @@ kr_identity_check(){
   else cp "$KE_D/identity.now" "$KE_D/identity.compare" || return 1; fi
   cmp -s "$KE_D/identity.compare" "$KE_B/sealed/identity.manifest" || kr_error 'original SDK or identity changed; retained for review'
 }
+kr_foreign_data_row(){
+  # Foreign application data is observed, never sourced or executed. Keep the
+  # historical root-owned row byte-for-byte for existing sealed receipts.
+  [ "$#" = 1 ] && kr_plain_path "$1" && [ -f "$1" ] || return 1
+  KFD_OWNER=$(stat -c %u "$1") || return 1
+  if [ "$KFD_OWNER" = 0 ]; then kr_snapshot_row "$1"; return "$?"; fi
+  case "$1" in /usr/local/etc/xray/*) :;; *) return 1;; esac
+  KFD_META=$(stat -c '%u:%g:%a:%h' "$1") && [ "$KFD_META" = 100:101:644:1 ] || return 1
+  KFD_HASH=$(hash_file "$1") && [ "$(stat -c '%u:%g:%a:%h' "$1")" = "$KFD_META" ] || return 1
+  printf 'FOREIGN_DATA %s %s %s\n' "$1" "$KFD_HASH" "$KFD_META"
+}
+kr_foreign_binary_dir_row(){
+  [ "$#" = 1 ] && [ "$1" = /usr/bin/xray ] && kr_plain_path "$1" && [ -d "$1" ] &&
+    [ "$(stat -c %u "$1")" = 0 ] || return 1
+  KFB_MODE=$(stat -c %a "$1") && [ "$((0$KFB_MODE & 022))" = 0 ] || return 1
+  KFB_META=$(stat -c '%d:%i:%u:%g:%a' "$1") || return 1
+  KFB_PROGRAM=$1/xray
+  kr_plain "$KFB_PROGRAM" && [ -f "$KFB_PROGRAM" ] || return 1
+  KFB_MODE=$(stat -c %a "$KFB_PROGRAM") && [ "$((0$KFB_MODE & 022))" = 0 ] || return 1
+  printf 'FOREIGN_DIRECTORY %s %s\n' "$1" "$KFB_META"
+  kr_snapshot_row "$KFB_PROGRAM" && [ "$(stat -c '%d:%i:%u:%g:%a' "$1")" = "$KFB_META" ]
+}
 kr_foreign_manifest(){
   (
+    KF_DIRECTORY_BINARY=0
     for KF_PATH in /usr/local/bin/xray /usr/bin/xray; do
-      ! exists "$KF_PATH" || kr_snapshot_row "$KF_PATH" || exit 1
+      exists "$KF_PATH" || continue
+      if [ "$KF_PATH" = /usr/bin/xray ] && [ -d "$KF_PATH" ]; then
+        kr_foreign_binary_dir_row "$KF_PATH" || exit 1
+        KF_DIRECTORY_BINARY=1
+      else kr_snapshot_row "$KF_PATH" || exit 1; fi
     done
     for KF_DIR in /etc/xray /usr/local/etc/xray /opt/xray; do
       if exists "$KF_DIR"; then
@@ -3255,13 +4976,17 @@ kr_foreign_manifest(){
         find "$KF_DIR" -type l > "$KE_D/foreign.links" || exit 1
         [ ! -s "$KE_D/foreign.links" ] || exit 1
         find "$KF_DIR" -type f > "$KE_D/foreign.files.raw" && LC_ALL=C sort "$KE_D/foreign.files.raw" > "$KE_D/foreign.files" || exit 1
-        while IFS= read -r KF_PATH; do kr_snapshot_row "$KF_PATH" || exit 1; done < "$KE_D/foreign.files"
+        while IFS= read -r KF_PATH; do kr_foreign_data_row "$KF_PATH" || exit 1; done < "$KE_D/foreign.files"
       fi
     done
     for KF_INIT in /etc/init.d/*; do
       exists "$KF_INIT" || continue
       KF_SVC=${KF_INIT##*/}; [ "$KF_SVC" != "$KR_SERVICE" ] || continue
-      case "$KF_SVC" in xray*) :;; *) grep -Eq '/(usr/local/bin|usr/bin)/xray([[:space:]"\047]|$)' "$KF_INIT" || continue;; esac
+      case "$KF_SVC" in xray*) :;; *)
+        if [ "$KF_DIRECTORY_BINARY" = 1 ]; then
+          grep -Eq '/(usr/local/bin/xray|usr/bin/xray(/xray)?)([[:space:]"\047]|$)' "$KF_INIT" || continue
+        else grep -Eq '/(usr/local/bin|usr/bin)/xray([[:space:]"\047]|$)' "$KF_INIT" || continue; fi;;
+      esac
       kr_snapshot_row "$KF_INIT" || exit 1
       kr_snapshot_row "/etc/conf.d/$KF_SVC" || exit 1
       KF_STATE=$(service_state "$KF_SVC") || exit 1
@@ -3273,8 +4998,14 @@ kr_foreign_manifest(){
         [ ! -f "$KF_TEXT" ] || awk '{gsub(/["\047=;,()]/," ");for(i=1;i<=NF;i++)if($i ~ /^\//)print $i}' "$KF_TEXT" > "$KE_D/foreign.references" || exit 1
         [ -f "$KF_TEXT" ] || continue
         while IFS= read -r KF_PATH; do
+          # Standard OpenRC pidfile spelling: substitute only this exact data
+          # token from the validated service basename, never evaluate shell.
+          case "$KF_PATH" in '/run/${RC_SVCNAME}.pid')
+            valid_name "$KF_SVC" || exit 1
+            KF_PATH=/run/$KF_SVC.pid;;
+          esac
           valid_path "$KF_PATH" || exit 1
-          [ ! -f "$KF_PATH" ] || kr_snapshot_row "$KF_PATH" || exit 1
+          [ ! -f "$KF_PATH" ] || kr_foreign_data_row "$KF_PATH" || exit 1
         done < "$KE_D/foreign.references"
       done
       for KF_PROC in /proc/[0-9]*; do
@@ -3284,13 +5015,28 @@ kr_foreign_manifest(){
           printf 'PROCESS %s %s %s\n' "${KF_PROC##*/}" "$KF_STAMP" "$KF_HASH";; esac
       done
     done
+    if [ "$KF_DIRECTORY_BINARY" = 1 ]; then
+      for KF_PROC in /proc/[0-9]*; do
+        KF_EXE=$(readlink "$KF_PROC/exe" 2>/dev/null) || continue
+        [ "$KF_EXE" = /usr/bin/xray/xray ] || continue
+        KF_STAMP=$(process_stamp "${KF_PROC##*/}") && KF_HASH=$(hash_file "$KF_PROC/exe") || exit 1
+        [ "$(process_stamp "${KF_PROC##*/}")" = "$KF_STAMP" ] || exit 1
+        printf 'PROCESS %s %s %s\n' "${KF_PROC##*/}" "$KF_STAMP" "$KF_HASH"
+      done
+    fi
   ) > "$1.raw" || return 1
   LC_ALL=C sort -u "$1.raw" > "$1" && rm "$1.raw"
 }
 kr_foreign_check(){ kr_foreign_manifest "$KE_D/foreign.now" && cmp -s "$KE_D/foreign.now" "$KE_B/sealed/foreign.manifest" || kr_error 'foreign Xray files, activation or processes changed'; }
 kr_source_state(){
-  if [ "$KE_SOURCE_PROGRAM" = "$KR_PROGRAM" ]; then KS_TEXT=$(kr_sdk "$KR_PROGRAM" status 2>/dev/null) || return 1
-  else KS_TEXT=$(timeout -k 2 15 "$KE_SOURCE_PROGRAM" status 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null) || return 1; fi
+  KS_QUERY=$KE_SOURCE_PROGRAM
+  if [ "${KR_HK1:-0}" = 1 ] && [ "$KS_QUERY" != "$KR_PROGRAM" ]; then KS_QUERY=$KE_ORIGINAL; fi
+  KS_RC=0
+  if [ "$KS_QUERY" = "$KR_PROGRAM" ]; then KS_TEXT=$(kr_sdk "$KR_PROGRAM" status 2>&1) || KS_RC=$?
+  else KS_TEXT=$(timeout -k 2 15 "$KS_QUERY" status 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1) || KS_RC=$?; fi
+  if [ "$KS_RC" != 0 ] && [ "$KS_QUERY" != "$KR_PROGRAM" ]; then
+    KS_TEXT=$(kr_sdk_private_query "$KE_ORIGINAL" status 2>&1) || return 1
+  elif [ "$KS_RC" != 0 ]; then return 1; fi
   printf '%s\n' "$KS_TEXT" | sed "s/$(printf '\033')\[[0-9;]*[[:alpha:]]//g;s/$(printf '\r')//g" | awk '
   {sub(/^[[:space:]]+/,"");sub(/[[:space:]]+$/,"")}
   /^[^[:alnum:]]*Current status: enabled$/{n++;s="enabled"}
@@ -3298,13 +5044,65 @@ kr_source_state(){
   END{if(n==1)print s;else exit 1}'
 }
 kr_source_worker() (
+  if [ "${KR_HK1:-0}" = 1 ]; then kr_ext_source_worker; exit "$?"; fi
   SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE
   NSP_INIT=/etc/init.d/$OLD_SVC; NSP_INIT_HASH=$(hash_file "$NSP_INIT") || exit 1
   NSP_CONF_HASH=absent; [ ! -f "/etc/conf.d/$OLD_SVC" ] || NSP_CONF_HASH=$(hash_file "/etc/conf.d/$OLD_SVC") || exit 1
   NSP_CANON=$(readlink -f "$SDK_BIN") && NSP_HASH=$(hash_file "$SDK_BIN") || exit 1
   suite_source_live_key
 )
+kr_source_supervisor_key() (
+  # A child incarnation may change during downloads; the owning supervisor may
+  # not. This is observation only, after the strict source-worker proof.
+  [ "$#" = 1 ] && printf '%s\n' "$1" | awk 'NR==1&&/^[1-9][0-9]*:[1-9][0-9]*$/{ok=1} END{exit !(ok&&NR==1)}' || exit 1
+  KSP_CHILD=${1%%:*}; KSP_STAMP=$(process_stamp "$KSP_CHILD") || exit 1
+  printf '%s\n' "$KSP_STAMP" | awk 'NR==1&&/^[0-9]+:[1-9][0-9]*$/{ok=1} END{exit !(ok&&NR==1)}' || exit 1
+  [ "${KSP_STAMP#*:}" = "${1#*:}" ] || exit 1
+  KSP_PARENT=${KSP_STAMP%%:*}; [ "$KSP_PARENT" != 0 ] && [ "$KSP_PARENT" != 1 ] || exit 1
+  KSP_PARENT_STAMP=$(process_stamp "$KSP_PARENT") || exit 1
+  printf '%s\n' "$KSP_PARENT_STAMP" | awk 'NR==1&&/^[0-9]+:[1-9][0-9]*$/{ok=1} END{exit !(ok&&NR==1)}' || exit 1
+  [ "$(process_stamp "$KSP_CHILD")" = "$KSP_STAMP" ] &&
+    [ "$(process_stamp "$KSP_PARENT")" = "$KSP_PARENT_STAMP" ] || exit 1
+  printf '%s:%s\n' "$KSP_PARENT" "$KSP_PARENT_STAMP"
+)
+kr_source_static_unchanged(){
+  for KSS_PATH in "/etc/init.d/$KE_SOURCE_SERVICE" "/etc/conf.d/$KE_SOURCE_SERVICE"; do
+    KSS_EXPECTED=$(kr_expected "$KSS_PATH" "$KE_B/sealed/snapshot.manifest") || return 1
+    [ "$(kr_fingerprint "$KSS_PATH")" = "$KSS_EXPECTED" ] || return 1
+  done
+  KSS_HASH=$(awk -v p="$KE_ORIGINAL" '$1=="ORIGINAL_SDK"&&$2==p{print $3;n++} END{if(n!=1)exit 1}' "$KE_B/sealed/identity.manifest") || return 1
+  [ "$KE_SOURCE_PROGRAM" = "$KE_ORIGINAL" ] && kr_plain "$KE_ORIGINAL" &&
+    [ -x "$KE_ORIGINAL" ] && [ "$(hash_file "$KE_ORIGINAL")" = "$KSS_HASH" ]
+}
+kr_source_key_check(){
+  [ -n "${KE_SOURCE_KEY:-}" ] || return 0
+  KSK_NOW=$(kr_source_worker) && [ -n "$KSK_NOW" ] || return 1
+  [ "$KSK_NOW" != "$KE_SOURCE_KEY" ] || return 0
+  # Only an unmodified generic original service may naturally respawn here.
+  # Named/managed/fresh sources, custom adapters and old receipts stay strict.
+  [ "$KE_MODE" = original ] && ! kr_ext_active || return 1
+  for KSK_PASS in before after; do
+    # Trust the in-memory staging anchor, never a replacement on-disk seal.
+    # These three small leaves contain every sealed input used by this branch.
+    kr_plain "$KE_B/sealed/seal" && [ -n "${KE_SEAL:-}" ] &&
+      [ "$(hash_file "$KE_B/sealed/seal")" = "$KE_SEAL" ] || return 1
+    for KSK_LEAF in source.supervisor snapshot.manifest identity.manifest; do
+      kr_plain "$KE_B/sealed/$KSK_LEAF" || return 1
+      KSK_HASH=$(awk -v p="./$KSK_LEAF" '$2==p{print $1;n++} END{if(n!=1)exit 1}' "$KE_B/sealed/seal") || return 1
+      [ "$(hash_file "$KE_B/sealed/$KSK_LEAF")" = "$KSK_HASH" ] || return 1
+    done
+    [ "$KSK_PASS" = before ] || continue
+    awk 'NR==1&&/^[1-9][0-9]*:[0-9]+:[1-9][0-9]*$/{ok=1} END{exit !(ok&&NR==1)}' "$KE_B/sealed/source.supervisor" || return 1
+    KSK_PARENT=$(cat "$KE_B/sealed/source.supervisor") || return 1
+    kr_source_static_unchanged && [ "$(kr_source_supervisor_key "$KSK_NOW")" = "$KSK_PARENT" ] || return 1
+    [ "$(kr_source_worker)" = "$KSK_NOW" ] &&
+      [ "$(kr_source_supervisor_key "$KSK_NOW")" = "$KSK_PARENT" ] && kr_source_static_unchanged || return 1
+  done
+  printf 'SOURCE_REVALIDATED %s %s %s\n' "$KE_SOURCE_KEY" "$KSK_NOW" "$KSK_PARENT" >> "$KE_B/ledger" || return 1
+  KE_SOURCE_KEY=$KSK_NOW
+}
 kr_source_absent() (
+  if [ "${KR_HK1:-0}" = 1 ]; then kr_ext_source_absent; exit "$?"; fi
   SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE
   if ! exists "$SDK_BIN"; then
     [ "$(kr_expected "$SDK_BIN" "$KE_B/sealed/plan.manifest")" = '- -' ] || exit 1
@@ -3373,18 +5171,48 @@ kr_candidate_connection() (
   stats "${KC_KEY%%:*}" && [ "$(worker_snapshot)" = "$KC_KEY" ] || exit 1
   printf '%s\n' "$ESTAB"
 )
+kr_source_connection() (
+  KSC_KEY=$(kr_source_worker) && [ -n "$KSC_KEY" ] || exit 1
+  KSC_PID=${KSC_KEY%%:*}
+  KSC_SOCKETS=$(ss -tanp 2>/dev/null) || exit 1
+  KSC_ESTAB=$(printf '%s\n' "$KSC_SOCKETS" | awk -v p="$KSC_PID" 'index($0,"pid="p",")&&($1=="ESTAB"||$2=="ESTAB"){n++}END{print n+0}') || exit 1
+  [ "$(kr_source_worker)" = "$KSC_KEY" ] || exit 1
+  printf '%s\n' "$KSC_ESTAB"
+)
+kr_owned_group_inode(){
+  [ "$#" = 1 ] || return 1
+  case "$1" in ''|/*|*/|*..*|*//*|*[!A-Za-z0-9_./-]*) return 1;; esac
+  [ "${1##*/}" = "openrc.$KR_SERVICE" ] || return 1
+  kr_plain_path "/sys/fs/cgroup/$1" && [ -d "/sys/fs/cgroup/$1" ] &&
+    [ "$(stat -fc %T "/sys/fs/cgroup/$1")" = cgroup2fs ] || return 1
+  stat -Lc %i "/sys/fs/cgroup/$1"
+}
 kr_table_owned(){
-  case "$1" in earnapp_limit) suite_table_owned "$1" earnapp earnapp-;;
+  case "$1" in earnapp_limit) suite_table_owned "$1" earnapp earnapp- >/dev/null 2>&1 || kr_legacy_table_owned "$1" earnapp;;
     earnapp_maintenance) suite_table_owned "$1" "$2" earnapp-maintenance-;;
     "$KR_TABLE")
+      [ "$2" = "$KR_SERVICE" ] || return 1
       KT_TEXT=$(nft list table inet "$KR_TABLE") || return 1
-      printf '%s\n' "$KT_TEXT" | awk -v table="$KR_TABLE" -v tag="$KR_TAG" '
+      # nft resolves a live binding to a quoted path and prints a removed group
+      # numerically. Require the live directory inode to match the same tag.
+      KT_QUOTED=$(printf '%s\n' "$KT_TEXT" | awk '$1=="socket"&&$2=="cgroupv2"&&$3=="level"&&substr($5,1,1)=="\""{q=$5;n++}END{if(n>1)exit 1;print q}') || return 1
+      KT_BOUND=
+      if [ -n "$KT_QUOTED" ]; then
+        case "$KT_QUOTED" in \"*\") :;; *) return 1;; esac
+        KT_GROUP=${KT_QUOTED#\"}; KT_GROUP=${KT_GROUP%\"}
+        KT_BOUND=$(kr_owned_group_inode "$KT_GROUP") || return 1
+      fi
+      printf '%s\n' "$KT_TEXT" | awk -v table="$KR_TABLE" -v tag="$KR_TAG" -v named="$KT_QUOTED" -v bound="$KT_BOUND" '
       function number(s){return s ~ /^[0-9]+$/ && length(s)<=20}
+      function binding(s,level,note){
+        if(number(s)&&s+0>0)return note==("\""tag":"s":"level":20\"")
+        return named!=""&&s==named&&number(bound)&&bound+0>0&&note==("\""tag":"bound":"level":20\"")
+      }
       {s=$0;sub(/^[[:space:]]+/,"",s);sub(/[[:space:]]+$/,"",s);if(s=="")next;n=split(s,a," ")}
       step==0 && s=="table inet "table" {"{step=1;next}
       step==1 && s=="chain output {"{step=2;next}
       step==2 && (s=="type filter hook output priority -10; policy accept;" || s=="type filter hook output priority filter - 10; policy accept;"){step=3;next}
-      step==3 && n==26 && a[1]=="socket"&&a[2]=="cgroupv2"&&a[3]=="level"&&number(a[4])&&a[4]+0>0&&a[4]+0<=255&&number(a[5])&&a[5]+0>0&&a[6]=="meta"&&a[7]=="l4proto"&&a[8]=="{"&&a[9]=="tcp,"&&a[10]=="udp"&&a[11]=="}"&&a[12]=="ct"&&a[13]=="state"&&a[14]=="new"&&a[15]=="ct"&&a[16]=="count"&&a[17]=="over"&&a[18]=="20"&&a[19]=="counter"&&a[20]=="packets"&&number(a[21])&&a[22]=="bytes"&&number(a[23])&&a[24]=="reject"&&a[25]=="comment"&&a[26]==("\""tag":"a[5]":"a[4]":20\""){step=4;next}
+      step==3 && n==26 && a[1]=="socket"&&a[2]=="cgroupv2"&&a[3]=="level"&&number(a[4])&&a[4]+0>0&&a[4]+0<=255&&binding(a[5],a[4],a[26])&&a[6]=="meta"&&a[7]=="l4proto"&&a[8]=="{"&&a[9]=="tcp,"&&a[10]=="udp"&&a[11]=="}"&&a[12]=="ct"&&a[13]=="state"&&a[14]=="new"&&a[15]=="ct"&&a[16]=="count"&&a[17]=="over"&&a[18]=="20"&&a[19]=="counter"&&a[20]=="packets"&&number(a[21])&&a[22]=="bytes"&&number(a[23])&&a[24]=="reject"&&a[25]=="comment"{step=4;next}
       step==4&&s=="}"{step=5;next} step==5&&s=="}"{step=6;next}{bad=1}
       END{exit bad||step!=6}' ;;
     *) return 1;; esac
@@ -3418,14 +5246,14 @@ kr_clear_table(){
   fi
 }
 kr_verify_limiter(){
-  kr_table_owned "$KR_TABLE" "$KR_SERVICE" || return 1
-  KL_KEY=$(kr_candidate_worker) || return 1
+  kr_table_owned "$KR_TABLE" "$KR_SERVICE" || { kr_error 'LIMIT_TABLE_OWNERSHIP_FAILED'; return 1; }
+  KL_KEY=$(kr_candidate_worker) || { kr_error 'LIMIT_WORKER_IDENTITY_FAILED'; return 1; }
   KL_GROUP=$(awk -F: '$1==0{print $3}' "/proc/${KL_KEY%%:*}/cgroup") || return 1
   KL_INODE=$(stat -Lc %i "/sys/fs/cgroup$KL_GROUP") || return 1
-  [ "$(cat "$KR_STATE/limit-key")" = "$KR_TAG:$(uname -r):$KL_INODE:20:$KL_GROUP" ] || return 1
+  [ "$(cat "$KR_STATE/limit-key")" = "$KR_TAG:$(uname -r):$KL_INODE:20:$KL_GROUP" ] || { kr_error 'LIMIT_CACHE_BINDING_FAILED'; return 1; }
   KL_TEXT=$(nft list table inet "$KR_TABLE") || return 1
   KL_HASH=$(printf '%s\n' "$KL_TEXT" | kr_normalize_nft | sha256sum) || return 1
-  [ "$(cat "$KR_STATE/limit-digest")" = "${KL_HASH%% *}" ]
+  [ "$(cat "$KR_STATE/limit-digest")" = "${KL_HASH%% *}" ] || { kr_error 'LIMIT_CACHE_DIGEST_FAILED'; return 1; }
 }
 kr_static_current(){
   while read -r KC_PATH KC_HASH KC_MODE KC_SOURCE; do
@@ -3445,7 +5273,7 @@ kr_static_current(){
   [ -z "$(runlevels_for earnapp)" ] && [ -z "$(runlevels_for kaleno)" ] || return 1
   [ "$(runlevels_for "$KR_SERVICE")" = default ] || return 1
   [ "$(service_state crond)" = 0 ] && exists /etc/runlevels/default/crond && exists /etc/runlevels/default/local || return 1
-  kr_saved_source_absent && kr_identity_check && kr_foreign_check
+  kr_saved_source_absent && kr_identity_check && kr_foreign_check && kr_ext_static
 }
 kr_load_receipt(){
   kr_plain "$1" && [ -s "$1" ] || return 1
@@ -3465,9 +5293,41 @@ kr_load_receipt(){
   valid_path "$KE_SOURCE_PROGRAM" && valid_path "$KE_ORIGINAL" || return 1
   [ "$(sed -n 's/^VERSION=//p' "$KE_B/sealed/settings")" = "$KR_VERSION" ] || return 1
   case "$(cat "$KE_B/phase")" in prepared|pausing|source-stop-intent|source-stopped|publishing|canonical-start-intent|active|restoring|restored) :;; *) return 1;; esac
+  kr_ext_load || return 1
+  KE_SAVED_UPDATER_RECEIPT=none
+  if [ -f "$KE_B/sealed/updater.receipt" ]; then
+    KE_SAVED_UPDATER_RECEIPT=$(cat "$KE_B/sealed/updater.receipt") || return 1
+    case "$KE_SAVED_UPDATER_RECEIPT" in none) :;; "$KR_BACKUP_PREFIX"updaters-*) valid_path "$KE_SAVED_UPDATER_RECEIPT" && kr_plain_path "$KE_SAVED_UPDATER_RECEIPT" || return 1;; *) return 1;; esac
+  fi
+}
+kr_bare_sdk_ready(){
+  # A vendor bootstrap can initialize the device before a later package fetch
+  # fails. Reuse those exact SDK/identity bytes instead of registering again.
+  kr_plain /usr/bin/earnapp && [ -x /usr/bin/earnapp ] &&
+    kr_sdk_source_hash_valid "$(hash_file /usr/bin/earnapp)" || return 1
+  for KBS_PATH in /etc/init.d/earnapp /etc/conf.d/earnapp /usr/local/bin/earnapp /opt/earnapp/earnapp \
+    /usr/local/lib/earnapp-original.sh /usr/local/sbin/earnapp-watchdog /usr/local/sbin/earnapp-recover \
+    /usr/local/sbin/earnapp-limit /etc/local.d/earnapp-limit.start /etc/earnapp/maintenance.conf \
+    /etc/earnapp/watchdog.conf /usr/local/lib/mivora.sh /usr/local/sbin/selnu /usr/local/sbin/tavik \
+    /usr/local/sbin/loren /etc/local.d/pavri.start /usr/local/lib/vesari /etc/init.d/kaleno /etc/conf.d/kaleno \
+    /usr/local/sbin/earnapp-kh1-bandwidth /usr/local/sbin/earnapp-us6-bandwidth /usr/local/sbin/hk1-runtime \
+    /etc/runlevels/*/earnapp /etc/runlevels/*/kaleno; do
+    ! exists "$KBS_PATH" || return 1
+  done
+  KBS_TABLES=$(nft list tables) || return 1
+  for KBS_TABLE in earnapp_limit earnapp_maintenance "$KR_TABLE"; do
+    ! printf '%s\n' "$KBS_TABLES" | grep -Fxq "table inet $KBS_TABLE" || return 1
+  done
+  SDK_BIN=/usr/bin/earnapp; OLD_SVC=earnapp
+  NSP_CANON=$(readlink -f "$SDK_BIN") || return 1
+  suite_source_references && kr_source_absent || return 1
+  KE_SDK_STATE=$(kr_source_state) || return 1
+  [ "$KE_SDK_STATE" != disabled ] || { printf '%s\n' 'INSTALL_STATE=SDK_DISABLED'; return 22; }
+  [ "$KE_SDK_STATE" = enabled ] || return 1
+  KE_MODE=fresh; KE_BOOTSTRAP_EXISTING=1; KE_SOURCE_KEY=
 }
 kr_detect(){
-  KE_MODE=fresh; KE_SOURCE_SERVICE=earnapp; KE_SOURCE_PROGRAM=/usr/bin/earnapp; KE_ORIGINAL=/usr/bin/earnapp
+  KE_MODE=fresh; KE_SOURCE_SERVICE=earnapp; KE_SOURCE_PROGRAM=/usr/bin/earnapp; KE_ORIGINAL=/usr/bin/earnapp; KE_BOOTSTRAP_EXISTING=0
   if exists "$KR_REGISTRY.pending"; then
     kr_load_receipt "$KR_REGISTRY.pending" || return 1
     kr_error 'an interrupted transaction needs restore --apply before installation'; return 1
@@ -3492,11 +5352,15 @@ kr_detect(){
     [ "$U_CURRENT_VERSION" = "$SUITE_VERSION" ] || return 1
     KE_MODE=managed; KE_ORIGINAL=$U_SOURCE; KE_SOURCE_PROGRAM=$U_SOURCE
   elif exists /usr/bin/earnapp; then
+    if ! exists /etc/init.d/earnapp; then kr_bare_sdk_ready; return "$?"; fi
     KE_MODE=original
+    kr_ext_detect || return 1
     for KD_TAG in old-common old-watchdog old-recover old-limit old-boot; do
       KD_PATH=$(suite_path "$KD_TAG") || return 1
       if exists "$KD_PATH"; then
-        kr_plain "$KD_PATH" && suite_legacy_hash "$KD_TAG" "$(hash_file "$KD_PATH")" || return 1
+        kr_plain "$KD_PATH" || return 1
+        KD_HASH=$(hash_file "$KD_PATH") || return 1
+        { suite_legacy_hash "$KD_TAG" "$KD_HASH" || kr_legacy_known_helper "$KD_TAG" "$KD_HASH" || kr_ext_legacy_known "$KD_TAG" "$KD_PATH" "$KD_HASH"; } || return 1
       fi
     done
     for KD_PATH in /usr/local/lib/mivora.sh /usr/local/sbin/selnu /usr/local/sbin/tavik /usr/local/sbin/loren /etc/local.d/pavri.start /usr/local/lib/vesari /etc/init.d/kaleno /etc/conf.d/kaleno; do
@@ -3510,14 +5374,19 @@ kr_detect(){
     suite_source_references || return 1
     return 0
   fi
-  kr_plain "$KE_ORIGINAL" && kr_plain "$KE_SOURCE_PROGRAM" && [ -x "$KE_SOURCE_PROGRAM" ] || return 1
-  (SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE; suite_source_init_valid "/etc/init.d/$OLD_SVC" && suite_source_config_valid) || return 1
+  if [ "${KR_HK1:-0}" = 1 ]; then
+    kr_hk1_sdk_pair_guard "$KE_ORIGINAL" && kr_hk1_sdk_pair_guard "$KE_SOURCE_PROGRAM" || return 1
+  else kr_plain "$KE_ORIGINAL" && kr_plain "$KE_SOURCE_PROGRAM" || return 1; fi
+  [ -x "$KE_SOURCE_PROGRAM" ] || return 1
+  if kr_ext_active; then kr_ext_source_init_valid "/etc/init.d/$KE_SOURCE_SERVICE" || return 1
+  else (SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE; suite_source_init_valid "/etc/init.d/$OLD_SVC" && suite_source_config_valid) || return 1; fi
   if [ "$KE_MODE" = original ]; then
     SDK_BIN=$KE_SOURCE_PROGRAM; OLD_SVC=$KE_SOURCE_SERVICE
     NSP_CANON=$(readlink -f "$SDK_BIN") || return 1
-    suite_source_references || return 1
+    if kr_ext_active; then kr_ext_source_references || return 1
+    else suite_source_references || return 1; fi
   else
-    UPDATER_MAIN_SVC=$KE_SOURCE_SERVICE; suite_updater_guard "$KE_ORIGINAL" || return 1
+    UPDATER_MAIN_SVC=$KE_SOURCE_SERVICE; suite_updater_guard "$KE_SOURCE_PROGRAM" || return 1
   fi
   KE_SDK_STATE=$(kr_source_state) || return 1
   [ "$KE_SDK_STATE" != disabled ] || { printf '%s\n' 'INSTALL_STATE=SDK_DISABLED'; return 22; }
@@ -3533,7 +5402,9 @@ kr_dependency_prepare(){
     fi
   done
   if command -v apk >/dev/null 2>&1; then
-    for KD_PACKAGE in gcompat libstdc++ musl-utils; do
+    # BusyBox stat may report cgroup2fs as UNKNOWN; the limiter requires the
+    # complete filesystem type support provided by Alpine coreutils.
+    for KD_PACKAGE in coreutils gcompat libstdc++ musl-utils; do
       if ! apk info -e "$KD_PACKAGE" >/dev/null 2>&1; then
         case " $KE_DEPENDENCIES " in *" $KD_PACKAGE "*) :;; *) KE_DEPENDENCIES="$KE_DEPENDENCIES $KD_PACKAGE";; esac
       fi
@@ -3585,6 +5456,67 @@ kr_vendor_prepare(){
   fi
   printf '%s\n' vendor-bootstrap-intent > "$KE_VENDOR_B/phase"
   printf 'VENDOR_SIDE_EFFECT_RECEIPT=%s\n' "$KE_VENDOR_B"
+}
+kr_bootstrap_filter(){
+  # Persist fixed event codes only, never arbitrary vendor/account output.
+  LC_ALL=C awk '
+    /^(BOOTSTRAP_[A-Z_]+|FETCH_[A-Z_]+|NEEDS_REGISTRATION)([[:space:]]|$)/ {
+      if(kept<64){print $1;kept++} next
+    }
+    {omitted++}
+    END{printf "VENDOR_DETAIL_LINES_OMITTED=%d\n",omitted+0}'
+}
+kr_bootstrap_private(){
+  U_D=$KE_D
+  KB_PIPE_RC=0
+  (
+    KB_INNER_RC=0
+    suite_bootstrap 5>&- 6>&- 7>&- 8>&- 9>&- || KB_INNER_RC=$?
+    printf '%s\n' "$KB_INNER_RC" > "$KE_D/bootstrap.result"
+  ) 2>&1 | kr_bootstrap_filter > "$KE_VENDOR_B/vendor.events.log" || KB_PIPE_RC=$?
+  [ "$KB_PIPE_RC" = 0 ] && [ -f "$KE_D/bootstrap.result" ] || return 1
+  KB_RC=$(cat "$KE_D/bootstrap.result") || return 1
+  case "$KB_RC" in ''|*[!0-9]*) return 1;; esac
+  printf 'BOOTSTRAP_EXIT_CODE=%s\n' "$KB_RC" >> "$KE_VENDOR_B/vendor.events.log" || return 1
+  # Recovery identity data is retained deliberately; other bootstrap scratch is
+  # under the transaction's own temporary directory and cleaned on exit.
+  KB_ID_COUNT=0
+  for KB_ID_DIR in "$KE_D"/bootstrap-*/identity; do
+    [ ! -e "$KB_ID_DIR" ] || {
+      kr_plain_path "$KB_ID_DIR" && [ -d "$KB_ID_DIR" ] || return 1
+      KB_ID_COUNT=$((KB_ID_COUNT+1))
+      KB_ID_DEST=$KE_VENDOR_B/identity-backup-$KB_ID_COUNT
+      mkdir "$KB_ID_DEST" && chmod 700 "$KB_ID_DEST" || return 1
+      for KB_ID_FILE in "$KB_ID_DIR"/*; do
+        [ -e "$KB_ID_FILE" ] || continue
+        kr_plain "$KB_ID_FILE" || return 1
+        case "${KB_ID_FILE##*/}" in machine.bytes|machine.meta|machine.target-meta|machine.link|dbus.bytes|dbus.meta|dbus.target-meta|dbus.link|uuid.bytes|uuid.meta|uuid.target-meta|uuid.link) :;; *) return 1;; esac
+        cp -p "$KB_ID_FILE" "$KB_ID_DEST/" || return 1
+      done
+    }
+  done
+}
+kr_cleanup_downloads(){
+  [ -n "${KE_B:-}" ] || return 0
+  case "$KE_B" in "$KR_BACKUP_PREFIX"*) :;; *) return 1;; esac
+  KC_CACHE=$KE_B/packages
+  [ -d "$KC_CACHE" ] || return 0
+  kr_plain_path "$KC_CACHE" || return 1
+  for KC_NAME in libc6_2.36-9+deb12u14_amd64.deb libgcc-s1_12.2.0-14+deb12u1_amd64.deb libstdc++6_12.2.0-14+deb12u1_amd64.deb 'libssl3_3.0.20-1~deb12u2_amd64.deb'; do
+    KC_FILE=$KC_CACHE/$KC_NAME
+    ! exists "$KC_FILE" || {
+      kr_plain "$KC_FILE" || return 1
+      case "$KC_NAME" in
+        libc6_*) KC_SHA=ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf;;
+        libgcc-s1_*) KC_SHA=3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7;;
+        libstdc++6_*) KC_SHA=5cd3171216d4ab0fc911cfe9c35509bf2dd8f47761c43b7f6a4296701551a24d;;
+        libssl3_*) KC_SHA=89be24b41bff568ee6e7caf5680a3d808e80315ed92e407056ce0fa7a5bda025;;
+      esac
+      [ "$(hash_file "$KC_FILE")" = "$KC_SHA" ] || return 1
+      rm "$KC_FILE" || return 1
+    }
+  done
+  rmdir "$KC_CACHE" 2>/dev/null || return 1
 }
 kr_vendor_quiesce(){
   for KV_SVC in earnapp_upgrader earnapp-upgrader; do
@@ -3702,8 +5634,9 @@ kr_pause(){
     ! exists "$KP_PATH" || kr_mutate "$KP_PATH" "$KE_B/sealed/pause" 755 || return 1
   done
   suite_wait_helpers || return 1
-  kr_lock_guard /run/earnapp-watchdog.lockfile && exec 7>>/run/earnapp-watchdog.lockfile
-  kr_opened_lock /run/earnapp-watchdog.lockfile 7 && flock -n 7 || return 1
+  KP_LEGACY_LOCK=$(kr_legacy_worker_lock) || return 1
+  kr_lock_guard "$KP_LEGACY_LOCK" && exec 7>>"$KP_LEGACY_LOCK"
+  kr_opened_lock "$KP_LEGACY_LOCK" 7 && flock -n 7 || return 1
   kr_lock_guard /run/earnapp-maintenance.worker.lockfile && exec 9>>/run/earnapp-maintenance.worker.lockfile
   kr_opened_lock /run/earnapp-maintenance.worker.lockfile 9 && flock -n 9 || return 1
   kr_lock_guard "$KR_WORKER_LOCK" && exec 5>>"$KR_WORKER_LOCK"
@@ -3784,8 +5717,12 @@ kr_snapshot(){
   printf '%s\n' "VERSION=$KR_VERSION" "MODE=$KE_MODE" "SOURCE_SERVICE=$KE_SOURCE_SERVICE" "SOURCE_PROGRAM=$KE_SOURCE_PROGRAM" "ORIGINAL=$KE_ORIGINAL" > "$KE_B/sealed/settings" || return 1
   printf '%s\n' "${KE_DEPENDENCIES:-none}" > "$KE_B/sealed/dependency-changes" || return 1
   printf '%s\n' "${KE_VENDOR_B:-none}" > "$KE_B/sealed/vendor-receipt" || return 1
+  printf '%s\n' "${KU_RECEIPT:-none}" > "$KE_B/sealed/updater.receipt" || return 1
   printf '%s\n' "${KE_BACKUP_PARENT_CREATED:-none}" > "$KE_B/sealed/backup-parent-change" || return 1
   printf '%s\n' "${KE_SOURCE_KEY:-absent}" > "$KE_B/sealed/source.key" || return 1
+  if [ "$KE_MODE" = original ] && ! kr_ext_active && [ -n "${KE_SOURCE_KEY:-}" ]; then
+    kr_source_supervisor_key "$KE_SOURCE_KEY" > "$KE_B/sealed/source.supervisor" || return 1
+  fi
   kr_identity_manifest "$KE_B/sealed/identity.manifest" && kr_foreign_manifest "$KE_B/sealed/foreign.manifest" || return 1
   for KS_SVC in earnapp kaleno "$KR_SERVICE" crond local; do
     runlevels_for "$KS_SVC" > "$KE_B/sealed/$KS_SVC.runlevels" || return 1
@@ -3802,6 +5739,9 @@ kr_snapshot(){
   else : > "$KE_B/sealed/cron.paused"; fi
   cp "$KE_B/sealed/cron.paused" "$KE_B/sealed/cron.final" || return 1
   printf '%s\n' '*/2 * * * * /usr/local/sbin/selnu >/dev/null 2>&1 # XRAY-RUNTIME-WATCHDOG' >> "$KE_B/sealed/cron.final"
+  if [ -n "${KE_SOURCE_KEY:-}" ]; then kr_source_connection > "$KE_B/sealed/source.connection" || return 1
+  else printf '0\n' > "$KE_B/sealed/source.connection" || return 1; fi
+  kr_ext_snapshot
 }
 kr_stage(){
   kr_stage_runtime "$KE_B/sealed/runtime" "$KE_ORIGINAL" "$KE_B/packages" || return 1
@@ -3816,6 +5756,7 @@ kr_stage(){
     KS_OLD_CONFIG=
   fi
   kr_emit_config "$KE_B/sealed/config" "$KS_OLD_CONFIG" || return 1
+  kr_ext_stage || return 1
   kr_runtime_fingerprint "$KE_B/sealed/runtime" > "$KE_B/sealed/runtime.fingerprint" || return 1
   find "$KE_B/sealed/runtime" -type l | grep . >/dev/null && return 1
   find "$KE_B/sealed/runtime" -type f | LC_ALL=C sort > "$KE_D/runtime.files" || return 1
@@ -3831,7 +5772,9 @@ kr_stage(){
     kr_plan "$(suite_path "$KS_TAG")" "$KE_B/sealed/helpers/$KS_TAG" "$KS_MODE" || return 1
   done
   kr_plan "/etc/init.d/$KR_SERVICE" "$KE_B/sealed/init" 755 && kr_plan "$KR_CONFIG" "$KE_B/sealed/config" 644 || return 1
-  kr_plain "$0" && cp "$0" "$KE_B/sealed/entry" && sh -n "$KE_B/sealed/entry" || return 1
+  kr_plain "$0" && [ "$(hash_file "$0")" = "$KE_SELF_HASH" ] &&
+    cp "$0" "$KE_B/sealed/entry" && [ "$(hash_file "$KE_B/sealed/entry")" = "$KE_SELF_HASH" ] &&
+    sh -n "$KE_B/sealed/entry" || return 1
   kr_plan "$KR_ENTRY" "$KE_B/sealed/entry" 755 || return 1
   for KS_TAG in old-common old-watchdog old-recover old-limit old-boot; do kr_plan "$(suite_path "$KS_TAG")" - - || return 1; done
   for KS_PATH in "$SUITE_REGISTRY" "$NAMING_REGISTRY" /etc/earnapp/maintenance.conf /etc/earnapp/watchdog.conf; do kr_plan "$KS_PATH" - - || return 1; done
@@ -3862,8 +5805,8 @@ kr_baseline_check(){
     runlevels_for "$KB_SVC" > "$KE_D/levels.baseline" || return 1
     cmp -s "$KE_D/levels.baseline" "$KE_B/sealed/$KB_SVC.runlevels" || return 1
   done
-  kr_identity_check && kr_foreign_check && kr_tables_unchanged || return 1
-  [ -z "${KE_SOURCE_KEY:-}" ] || [ "$(kr_source_worker)" = "$KE_SOURCE_KEY" ]
+  kr_identity_check && kr_foreign_check && kr_tables_unchanged && kr_ext_baseline || return 1
+  kr_source_key_check
 }
 kr_wait_candidate(){
   KW_N=0
@@ -3884,6 +5827,19 @@ kr_wait_connection(){
       [ "$KWC_GOOD" -lt 3 ] || return 0
     else KWC_GOOD=0; fi
     KWC_PREVIOUS=$KWC_KEY; KWC_N=$((KWC_N+1)); [ "$KWC_N" = 45 ] || sleep 1
+  done
+  return 21
+}
+kr_wait_source_connection(){
+  KWS_GOOD=0; KWS_N=0; KWS_PREVIOUS=
+  while [ "$KWS_N" -lt 45 ]; do
+    KWS_KEY=$(kr_source_worker) && KWS_ESTAB=$(kr_source_connection) || return 1
+    case "$KWS_ESTAB" in ''|*[!0-9]*) return 1;; esac
+    if [ "$KWS_ESTAB" -gt 0 ]; then
+      if [ "$KWS_KEY" = "$KWS_PREVIOUS" ]; then KWS_GOOD=$((KWS_GOOD+1)); else KWS_GOOD=1; fi
+      [ "$KWS_GOOD" -lt 3 ] || return 0
+    else KWS_GOOD=0; fi
+    KWS_PREVIOUS=$KWS_KEY; KWS_N=$((KWS_N+1)); [ "$KWS_N" = 45 ] || sleep 1
   done
   return 21
 }
@@ -3949,7 +5905,7 @@ kr_restore_transaction(){
   # Validate every target before touching a candidate or a healthy source.
   kr_load_receipt "$KE_B/registry.record" || return 1
   while read -r KR_PATH KR_HASH KR_MODE; do kr_allowed "$KR_PATH" || return 1; done < "$KE_B/sealed/snapshot.manifest"
-  kr_identity_check && kr_foreign_check || return 1
+  kr_identity_check && kr_foreign_check && kr_ext_before_restore || return 1
   kr_phase restoring || return 1
   # A prepared/pausing transaction has never attempted candidate startup.
   if grep -Fxq 'START_CANONICAL' "$KE_B/ledger"; then
@@ -3966,6 +5922,7 @@ kr_restore_transaction(){
   # Preserve paused cron until source protection is rebuilt with the new inode.
   while read -r KR_PATH KR_HASH KR_MODE; do
     case "$KR_PATH" in /etc/crontabs/root|"$KR_REGISTRY"|"$KR_REGISTRY.pending") continue;; esac
+    kr_ext_restore_deferred "$KR_PATH" && continue
     if [ "$KR_HASH" = - ]; then kr_mutate "$KR_PATH" - - || return 1
     else kr_mutate "$KR_PATH" "$KE_B/sealed/files$KR_PATH" "$KR_MODE" || return 1; fi
   done < "$KE_B/sealed/snapshot.manifest"
@@ -3982,10 +5939,18 @@ kr_restore_transaction(){
     elif [ -f "$KE_B/sealed/earnapp_limit.nft" ] || [ -f "$KE_B/sealed/earnapp_maintenance.nft" ]; then
       # A supported historical limiter must regenerate against this incarnation.
       [ -x /usr/local/sbin/earnapp-limit ] || return 1
-      /usr/local/sbin/earnapp-limit --locked 20 9>&7 5>&- 6>&- 7>&- 8>&- >/dev/null 2>&1 || return 1
+      kr_legacy_restore_limit >/dev/null 2>&1 || return 1
     fi
   fi
-  kr_identity_check && kr_foreign_check && kr_prerequisites_restore || return 1
+  kr_ext_after_source_restore && kr_identity_check && kr_foreign_check && kr_prerequisites_restore || return 1
+  if [ "$(cat "$KE_B/sealed/source.connection")" -gt 0 ]; then
+    kr_wait_source_connection || { printf '%s\n' 'RESTORE_STATE=CONNECTION_PENDING; source is running, receipt retained.' >&2; return 1; }
+  fi
+  if [ "${KE_SAVED_UPDATER_RECEIPT:-none}" != none ]; then
+    KU_RECEIPT=$KE_SAVED_UPDATER_RECEIPT
+    kr_updaters_restore || return 1
+    KU_COMMITTED=1
+  fi
   KR_CRON=$(kr_expected /etc/crontabs/root "$KE_B/sealed/snapshot.manifest") || return 1
   if [ "$KR_CRON" = '- -' ]; then kr_mutate /etc/crontabs/root - - || return 1
   else kr_mutate /etc/crontabs/root "$KE_B/sealed/files/etc/crontabs/root" "${KR_CRON#* }" || return 1; fi
@@ -4008,13 +5973,18 @@ kr_restore_transaction(){
 }
 kr_exit(){
   KX_RC=$?; trap - 0 HUP INT TERM
+  KX_CORE_RESTORED=1
   if [ "${KE_RESUME:-0}" = 1 ]; then
     kr_resume_undo || printf '%s\n' 'FAIL: pending registration resume stopped on unknown state; pending receipt retained.' >&2
   fi
   if [ "${KE_TX:-0}" = 1 ] && [ "$KX_RC" != 0 ]; then
     printf '%s\n' 'Transaction interrupted or validation failed; restoring the sealed previous state.' >&2
-    if ! kr_restore_transaction; then printf '%s\n' 'FAIL: automatic rollback stopped on unknown state; receipt and pending pointer retained for review.' >&2; fi
+    if ! kr_restore_transaction; then KX_CORE_RESTORED=0; printf '%s\n' 'FAIL: automatic rollback stopped on unknown state; receipt and pending pointer retained for review.' >&2; fi
   fi
+  if [ "$KX_RC" != 0 ] && [ "$KX_CORE_RESTORED" = 1 ] && [ -n "${KU_RECEIPT:-}" ] && [ "${KU_COMMITTED:-0}" != 1 ]; then
+    kr_updaters_restore || printf '%s\n' 'UPDATER_RESTORE_PENDING=owned receipt retained for review.' >&2
+  fi
+  kr_cleanup_downloads || printf '%s\n' 'OWN_DOWNLOAD_CACHE_RETAINED=unexpected state; review required.' >&2
   for KX_DIR in ${KE_LOCK_DIRS:-}; do rmdir "$KX_DIR" 2>/dev/null || true; done
   if [ -n "${KE_D:-}" ]; then
     case "$KE_D" in /tmp/xray-runtime-*) rm -rf "$KE_D";; esac
@@ -4022,32 +5992,52 @@ kr_exit(){
   exit "$KX_RC"
 }
 kr_context(){
-  umask 077; KE_TX=0; KE_RESUME=0; KE_LOCK_DIRS=
+  umask 077; KE_TX=0; KE_RESUME=0; KE_LOCK_DIRS=; KR_SITE=none; KR_HK1=0; KR_EXT_ACTIVE=0; KU_RECEIPT=; KU_COMMITTED=0
   KE_D=$(mktemp -d /tmp/xray-runtime-XXXXXXXX) || return 1
   U_D=$KE_D
   trap kr_exit 0; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
 }
 kr_engine_precheck() (
-  kr_context && kr_dependency_prepare check && kr_preconditions && kr_detect || exit "$?"
+  kr_context && kr_dependency_prepare check && kr_preconditions || exit "$?"
+  if ! exists "$KR_REGISTRY" && ! exists "$KR_REGISTRY.pending" && exists /usr/bin/earnapp; then
+    kr_updaters_probe || exit 1
+    if [ "$KU_MODE" = owned ]; then printf '%s\n' 'PRECHECK_STATE=OWNED_UPDATER_PAUSE_REQUIRED' 'PLANNED_CHANGE=seal, stop and disable only verified SDK updater before migration.'; exit 25; fi
+  fi
+  kr_detect || exit "$?"
   if [ "$KE_MODE" = current ]; then kr_outcome; exit "$?"; fi
   printf 'PRECHECK_STATE=READY\nMODE=%s\nTARGET_SERVICE=%s\nTARGET_PROGRAM=%s\n' "$KE_MODE" "$KR_SERVICE" "$KR_PROGRAM"
   if ! exists /etc/runlevels/default/crond || ! exists /etc/runlevels/default/local || [ "$(service_state crond)" != 0 ]; then
     printf '%s\n' 'PLANNED_SHARED_PREREQUISITES=activate crond/local default; start crond if stopped; rollback removes only owned activation and retains shared service.'
   fi
-  if [ "$KE_MODE" = fresh ]; then printf '%s\n' 'VENDOR_BOOTSTRAP=REQUIRED; SDK and vendor side effects are retained on fresh restore.'; fi
+  if [ "$KE_MODE" = fresh ]; then
+    if [ "${KE_BOOTSTRAP_EXISTING:-0}" = 1 ]; then printf '%s\n' 'VENDOR_BOOTSTRAP=SKIPPED_REUSED_INITIALIZED_SDK'
+    else printf '%s\n' 'VENDOR_BOOTSTRAP=REQUIRED; SDK and vendor side effects are retained on fresh restore.'; fi
+  fi
 )
 kr_engine_status() (
   require_root && kr_context && kr_dependency_prepare check && kr_preconditions && kr_detect || exit "$?"
   [ "$KE_MODE" = current ] || { printf 'INSTALL_STATE=NOT_CURRENT\nMODE=%s\n' "$KE_MODE"; exit 1; }
   kr_outcome
 )
-kr_engine_install() (
+# Install and restore run in the CLI process so a PID-targeted timeout reaches
+# their transaction traps even when BusyBox timeout does not signal a group.
+kr_engine_install() {
   kr_context || exit 1
+  kr_plain_path "$0" && kr_plain "$0" && [ -f "$0" ] || {
+    kr_error 'invoke installation using the absolute path of the saved script'; exit 1;
+  }
+  KE_SELF_HASH=$(hash_file "$0") || exit 1
   [ "$(uname -m)" = x86_64 ] && [ -f /etc/alpine-release ] || exit 1
   if [ "$APPLY" = 1 ] && ! exists "$KR_REGISTRY" && ! exists "$KR_REGISTRY.pending"; then
     kr_dependency_prepare apply || exit "$?"
   else kr_dependency_prepare check || exit "$?"; fi
-  kr_preconditions && kr_detect || exit "$?"
+  kr_preconditions || exit "$?"
+  if [ "$APPLY" = 1 ] && ! exists "$KR_REGISTRY" && ! exists "$KR_REGISTRY.pending"; then
+    require_root && kr_lock || exit 1
+    kr_updaters_recover_pending || exit 1
+    if exists /usr/bin/earnapp; then kr_updaters_pause || exit 1; fi
+  fi
+  kr_detect || exit "$?"
   if [ "$KE_MODE" = current ]; then
     if [ "$APPLY" = 1 ] && [ "$(sed -n 's/^MODE=//p' "$KE_B/sealed/settings")" = fresh ] &&
        [ -s /etc/earnapp/registered ] && [ "$(kr_source_state)" = enabled ] && [ "$(service_state "$KR_SERVICE")" = 3 ]; then
@@ -4058,19 +6048,18 @@ kr_engine_install() (
     exit "$KE_CURRENT_RC"
   fi
   [ "$APPLY" = 1 ] || { printf 'DRY_RUN=1\nMODE=%s\nTARGET=%s\n' "$KE_MODE" "$KR_PROGRAM"; exit 0; }
-  require_root && kr_lock && kr_detect || exit "$?"
+  require_root || exit 1
+  [ -n "$KE_LOCK_DIRS" ] || kr_lock || exit 1
+  kr_detect || exit "$?"
   if [ "$KE_MODE" = fresh ]; then
-    # Boundary is pinned in legacy-core. Its output can contain account links.
-    kr_vendor_prepare || exit 1
     SDK_BIN=/usr/bin/earnapp
-    mkdir "$KE_VENDOR_B/bootstrap-work" || exit 1
-    U_D=$KE_VENDOR_B/bootstrap-work
-    KB_RC=0; suite_bootstrap 5>&- 6>&- 7>&- 8>&- 9>&- > "$KE_VENDOR_B/vendor.private.log" 2>&1 || KB_RC=$?
-    U_D=$KE_D
-    case "$KB_RC" in 0|20) :;; *) kr_error 'vendor bootstrap failed; vendor SDK/identity side effects retained for review'; exit 1;; esac
+    if [ "${KE_BOOTSTRAP_EXISTING:-0}" != 1 ]; then
+      # Boundary is pinned in legacy-core. Its output can contain account links.
+      kr_vendor_prepare && kr_bootstrap_private || exit 1
+      case "$KB_RC" in 0|20) :;; *) kr_error 'vendor bootstrap failed; vendor SDK/identity side effects retained for review'; exit 1;; esac
+      UPDATER_MAIN_SVC=earnapp; kr_vendor_quiesce || { kr_error 'vendor updater active or unknown; explicit updater review is required'; exit 1; }
+    else printf '%s\n' 'BOOTSTRAP_RETRY=verified SDK and identity retained; vendor bootstrap skipped.'; fi
     [ -x /usr/bin/earnapp ] && kr_plain /usr/bin/earnapp || exit 1
-    # Only a newly created updater with the strict known scalar contract is owned.
-    UPDATER_MAIN_SVC=earnapp; kr_vendor_quiesce || { kr_error 'vendor updater active or unknown; explicit updater review is required'; exit 1; }
     if exists /etc/init.d/earnapp; then
       (SDK_BIN=/usr/bin/earnapp; OLD_SVC=earnapp; suite_source_init_valid /etc/init.d/earnapp && suite_source_config_valid) || exit 1
       KE_SOURCE_KEY=$(kr_source_worker 2>/dev/null) || {
@@ -4099,7 +6088,8 @@ kr_engine_install() (
     cmp -s "$KE_D/levels.before-stop" "$KE_B/sealed/$KP_SVC.runlevels" || exit 1
   done
   if [ -n "${KE_SOURCE_KEY:-}" ]; then
-    [ "$(kr_source_worker)" = "$KE_SOURCE_KEY" ] || exit 1
+    kr_source_key_check || exit 1
+    kr_ext_before_stop || exit 1
     kr_phase source-stop-intent && printf 'STOP_SOURCE\n' >> "$KE_B/ledger" || exit 1
     timeout -k 5 30 rc-service "$KE_SOURCE_SERVICE" stop 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || exit 1
     kr_source_absent || exit 1
@@ -4121,20 +6111,22 @@ kr_engine_install() (
     timeout -k 5 30 rc-service "$KR_SERVICE" start 5>&- 6>&- 7>&- 8>&- 9>&- >/dev/null 2>&1 || exit 1
     kr_wait_candidate || exit 1
     /usr/local/sbin/loren --locked 20 9>&5 5>&- 6>&- 7>&- 8>&- >/dev/null 2>&1 && kr_verify_limiter || exit 1
+    kr_ext_after_start || exit 1
     # A healthy source must be restored if its replacement has no connection.
     KE_CONNECTION_RC=0; kr_wait_connection || KE_CONNECTION_RC=$?
     case "$KE_CONNECTION_RC" in 0) :;; 21)
-      if [ "$KE_MODE" != fresh ]; then
+      if [ "$KE_MODE" != fresh ] && [ "$(cat "$KE_B/sealed/source.connection")" -gt 0 ]; then
         printf '%s\n' 'CANDIDATE_STATE=HEALTHY_PENDING; previous verified source will be restored.' >&2; exit 21
       fi;; *) exit 1;; esac
   fi
   kr_mutate /etc/crontabs/root "$KE_B/sealed/cron.final" 600 && kr_mutate "$KR_REGISTRY" "$KE_B/registry.record" 600 || exit 1
   kr_mutate "$KR_REGISTRY.pending" - - && kr_phase active || exit 1
   kr_static_current || exit 1
+  kr_updaters_commit || exit 1
   KE_TX=0
   kr_outcome
-)
-kr_engine_restore() (
+}
+kr_engine_restore() {
   require_root && kr_context && kr_dependency_prepare check && kr_preconditions || exit 1
   if exists "$KR_REGISTRY.pending"; then KR_POINTER=$KR_REGISTRY.pending
   else KR_POINTER=$KR_REGISTRY; fi
@@ -4143,7 +6135,7 @@ kr_engine_restore() (
   kr_lock || exit 1
   kr_load_receipt "$KR_POINTER" || exit 1
   kr_pause && kr_restore_transaction
-)
+}
 kr_engine_names(){ printf 'VERSION=%s\nSERVICE=%s\nPROGRAM=%s\nCONFIG=%s\nREGISTRY=%s\nENTRY=%s\n' "$KR_VERSION" "$KR_SERVICE" "$KR_PROGRAM" "$KR_CONFIG" "$KR_REGISTRY" "$KR_ENTRY"; }
 kr_engine_diagnose() (
   KD_SCOPE='DIAGNOSTIC_SCOPE=network exit only; SDK account region and earnings are unverified.'
@@ -4176,7 +6168,205 @@ EOF
 )
 unified_main(){
   CMD=$1; APPLY=$2
-  case "$CMD" in install|setup) kr_engine_install;; precheck) kr_engine_precheck;; status) kr_engine_status;; restore) kr_engine_restore;; names) kr_engine_names;; diagnose) kr_engine_diagnose;; *) printf '%s\n' 'Usage: earnapp-maintenance.sh {install|precheck|status|restore|names|diagnose} [--apply]' >&2; return 64;; esac
+  printf '%s\n' 'APPLICATION=EarnApp'
+  case "$CMD" in install|setup) kr_engine_install;; precheck) kr_engine_precheck;; status) kr_engine_status;; restore) kr_engine_restore;; names) kr_engine_names;; diagnose) kr_engine_diagnose;; diagnostics) kr_engine_diagnostics;; *) printf '%s\n' 'Usage: earnapp-maintenance.sh {install|precheck|status|restore|names|diagnose|diagnostics} [--apply]' >&2; return 64;; esac
+}
+
+# Manual, local-only support export. Identity data and rollback receipts are
+# neither read nor copied; sourcing this module performs no collection.
+kr_diagnostics_directory() (
+  [ "$#" = 1 ] && kr_plain_path "$1" || exit 1
+  case "$1" in */) exit 1;; esac
+  KDD_PATH=$1
+  while :; do
+    [ -d "$KDD_PATH" ] && [ ! -L "$KDD_PATH" ] &&
+      [ "$(stat -c %u "$KDD_PATH" 2>/dev/null)" = 0 ] || exit 1
+    KDD_MODE=$(stat -c %a "$KDD_PATH" 2>/dev/null) || exit 1
+    case "$KDD_MODE" in ''|*[!0-7]*) exit 1;; esac
+    if [ "$((0$KDD_MODE & 022))" != 0 ]; then
+      # The default root-owned sticky export parent is safe for newly created
+      # private inodes. Other writable destination/ancestor directories stop.
+      case "$KDD_PATH" in /tmp|/var/tmp) [ "$((0$KDD_MODE & 01000))" != 0 ] || exit 1;; *) exit 1;; esac
+    fi
+    [ "$KDD_PATH" != / ] || break
+    KDD_PATH=${KDD_PATH%/*}; [ -n "$KDD_PATH" ] || KDD_PATH=/
+  done
+)
+
+kr_diagnostics_file_state() (
+  [ "$#" = 1 ] || exit 1
+  if ! kr_plain_path "$1" >/dev/null 2>&1; then printf 'unsafe\n'; exit 0; fi
+  if ! exists "$1"; then printf 'absent\n'; exit 0; fi
+  if ! kr_diagnostics_directory "${1%/*}" >/dev/null 2>&1; then printf 'unsafe\n'; exit 0; fi
+  if [ -f "$1" ] && [ "$(stat -c %u:%h "$1" 2>/dev/null)" = 0:1 ]; then
+    KDF_MODE=$(stat -c %a "$1" 2>/dev/null) || exit 1
+    case "$KDF_MODE" in ''|*[!0-7]*) printf 'unsafe\n'; exit 0;; esac
+    if [ "$((0$KDF_MODE & 022))" = 0 ]; then printf 'regular\n'; exit 0; fi
+  fi
+  printf 'unsafe\n'
+)
+
+# This is also applied after collection, so a future collector cannot export
+# arbitrary SDK text by mistake. Log lines contain fixed events/enums/counts;
+# regex removal alone cannot reliably recognize short host or account names.
+kr_diagnostics_filter() {
+  LC_ALL=C awk -v version="$KR_VERSION" '
+    BEGIN {
+      events=" BAD RECOVER RECOVERY_FAILED CONNECTION_CHECK_OK CONNECTION_PENDING LIMIT_UNAVAILABLE SDK_DISABLED SDK_UNREGISTERED SDK_STATE_UNKNOWN WORKER_OWNERSHIP_OR_COUNT_UNKNOWN AGE_PROBE_FAILED STATS_FAILED NETWORK_BAD LIMIT_MAINTENANCE_FAILED BAD_TRIGGER BAD_ARGUMENTS FALLBACK_START_FAILED FALLBACK_START_REFUSED SDK_CHANGED_OR_COOLDOWN WORKER_OR_FAULT_CHANGED SDK_CHANGED_BEFORE_STOP WORKER_OR_FAULT_CHANGED_BEFORE_STOP WORKER_CHANGED_BEFORE_STOP STOP_INCOMPLETE STOP_UNCONFIRMED SDK_CHANGED START_REFUSED START_FAILED WORKER_CHANGED WORKER_OR_SDK_CHANGED WORKER_OR_FAULT_CHANGED FAULT_CHANGED RECOVERY_COOLDOWN LOCK_BUSY "
+      reasons=" manual worker_missing no_tcp resource_high WORKER_CHANGED_AFTER_LIMIT WORKER_CHANGED SDK_NOT_ENABLED SERVICE_NOT_RUNNING WORKER_IDENTIFICATION_FAILED BIRTH_PROBE_FAILED STATS_FAILED NO_SUSTAINED_TCP "
+      failures=" worker_identity worker_missing worker_stat supervisor_stat cgroup_v2 cgroup_path dedicated_cgroup shared_pid1 cgroup_mount unrelated_members nft_permission nft_read cgroup_changed probe_must_run_outside probe_low_headroom kernel_probe probe_send probe_read cgroup_match_ambiguous outside_probe_send cgroup_match_not_exclusive probe_cleanup nft_check nft_apply cache_write "
+    }
+    function emit(s) {if(length(s)<=1024 && total+length(s)+1<=16384){print s;total+=length(s)+1}}
+    $0=="APPLICATION=EarnApp" || $0=="SDK_VERSION=1.665.73" || $0=="SDK_VERSION_SOURCE=pinned_artifact" {emit($0);next}
+    $0=="INSTALLER_VERSION=" version && version~/^[0-9.]+$/ && length(version)<=24 {emit($0);next}
+    /^(SERVICE_STARTED_MARKER|PROGRAM_STATE|OWN_LOG_STATE)=(present|absent|regular|unsafe)$/ {emit($0);next}
+    /^SERVICE_HEALTH=(started_marker_only|no_started_marker|unknown)$/ {emit($0);next}
+    /^(OWN_HASH_COUNT|OWN_STATE_FILE_COUNT)=[0-9]+$/ {split($0,a,"=");if(length(a[2])<=6)emit($0);next}
+    /^OWN_STATE_FILE_COUNT=unavailable$/ {emit($0);next}
+    /^(PROGRAM|ENTRY|COMMON|WATCHDOG|RECOVER|LIMIT|BOOT|INIT)_SHA256=/ {
+      if(split($0,a,"=")==2 && NF==1 && length(a[2])==64 && a[2]~/^[0-9a-f]+$/)emit($0);next
+    }
+    $1=="LOG" {
+      if(logs>=80)next
+      at=0;for(i=2;i<=NF;i++)if($i=="APPLICATION=EarnApp"){at=i;break}
+      if(!at || at==NF)next
+      event=$(at+1);if(index(events," " event " ")==0)next
+      s="LOG APPLICATION=EarnApp " event
+      for(i=at+2;i<=NF;i++) {
+        field=$i;key=field;sub(/=.*/,"",key);value=substr(field,length(key)+2)
+        if(key~/^(pid|udp|fd|tcp|estab|rss|flows|samples|limit|level)$/ && value~/^[0-9]+$/ && length(value)<=10){s=s " " field;continue}
+        if(key=="count" && value~/^[0-9]+\/[0-9]+$/ && length(value)<=21){s=s " " field;continue}
+        if(key=="span" && value~/^[0-9]+s$/ && length(value)<=11){s=s " " field;continue}
+        if(key=="reason" && index(reasons," " value " ")>0){s=s " " field;continue}
+        if(field=="service=running" || field=="stats=readable"){s=s " " field;continue}
+        if(event=="LIMIT_UNAVAILABLE" && index(failures," " field " ")>0)s=s " " field
+      }
+      emit(s);logs++
+    }'
+}
+
+kr_diagnostics_support() (
+  printf 'APPLICATION=EarnApp\nINSTALLER_VERSION=%s\nSDK_VERSION=1.665.73\nSDK_VERSION_SOURCE=pinned_artifact\n' "$KR_VERSION"
+  # OpenRC marker observation is deliberately distinct from verified live
+  # health. Do not execute init/status hooks or invoke any SDK command here.
+  KDS_MARKER=$(kr_diagnostics_file_state "/run/openrc/started/$KR_SERVICE") || exit 1
+  case "$KDS_MARKER" in
+    regular) printf 'SERVICE_STARTED_MARKER=present\nSERVICE_HEALTH=started_marker_only\n';;
+    absent) printf 'SERVICE_STARTED_MARKER=absent\nSERVICE_HEALTH=no_started_marker\n';;
+    *) printf 'SERVICE_STARTED_MARKER=unsafe\nSERVICE_HEALTH=unknown\n';;
+  esac
+  printf 'PROGRAM_STATE=%s\n' "$(kr_diagnostics_file_state "$KR_PROGRAM")"
+  KDS_HASHES=0
+  while read -r KDS_LABEL KDS_FILE; do
+    [ "$(kr_diagnostics_file_state "$KDS_FILE")" = regular ] || continue
+    KDS_HASH=$(hash_file "$KDS_FILE") || exit 1
+    kr_hash_valid "$KDS_HASH" || exit 1
+    printf '%s_SHA256=%s\n' "$KDS_LABEL" "$KDS_HASH"
+    KDS_HASHES=$((KDS_HASHES+1))
+  done <<EOF
+PROGRAM $KR_PROGRAM
+ENTRY $KR_ENTRY
+COMMON /usr/local/lib/mivora.sh
+WATCHDOG /usr/local/sbin/selnu
+RECOVER /usr/local/sbin/tavik
+LIMIT /usr/local/sbin/loren
+BOOT /etc/local.d/pavri.start
+INIT /etc/init.d/$KR_SERVICE
+EOF
+  printf 'OWN_HASH_COUNT=%s\n' "$KDS_HASHES"
+  if kr_diagnostics_directory "$KR_STATE" >/dev/null 2>&1; then
+    KDS_FILES=0
+    for KDS_FILE in "$KR_STATE"/* "$KR_STATE"/.[!.]* "$KR_STATE"/..?*; do
+      [ -e "$KDS_FILE" ] || [ -L "$KDS_FILE" ] || continue
+      [ "$(kr_diagnostics_file_state "$KDS_FILE")" = regular ] || continue
+      KDS_FILES=$((KDS_FILES+1))
+      [ "$KDS_FILES" -le 999999 ] || exit 1
+    done
+    printf 'OWN_STATE_FILE_COUNT=%s\n' "$KDS_FILES"
+  else printf 'OWN_STATE_FILE_COUNT=unavailable\n'; fi
+  KDS_LOG_STATE=$(kr_diagnostics_file_state "$KR_LOG") || exit 1
+  printf 'OWN_LOG_STATE=%s\n' "$KDS_LOG_STATE"
+  if [ "$KDS_LOG_STATE" = regular ]; then
+    # Input, output line count, line size and total report size are bounded.
+    # Never export vendor logs, rotated history, SDK status or system journals.
+    tail -c 8192 "$KR_LOG" 2>/dev/null | tail -n 80 |
+      kr_redact_stream | sed 's/^/LOG /' | kr_diagnostics_filter
+  fi
+)
+
+kr_diagnostics_bundle() (
+  [ "$#" = 1 ] && [ "$(id -u)" = 0 ] || {
+    printf '%s\n' 'FAIL: EarnApp diagnostics requires root and one existing output directory.' >&2; exit 1;
+  }
+  KD_OUT=$1
+  kr_diagnostics_directory "$KD_OUT" >/dev/null 2>&1 || {
+    printf '%s\n' 'FAIL: EarnApp diagnostics output directory is unsafe or unavailable.' >&2; exit 1;
+  }
+  KD_PARENT_KEY=$(stat -c %d:%i "$KD_OUT") || exit 1
+  umask 077
+  KD_WORK=; KD_WORK_KEY=; KD_PARTIAL=; KD_ARCHIVE=; KD_FILE_KEY=; KD_SUCCESS=0
+  kr_diagnostics_cleanup() {
+    KDC_RC=0
+    kr_diagnostics_directory "$KD_OUT" >/dev/null 2>&1 &&
+      [ "$(stat -c %d:%i "$KD_OUT" 2>/dev/null)" = "$KD_PARENT_KEY" ] || return 1
+    if [ -n "$KD_WORK" ]; then
+      if [ -d "$KD_WORK" ] && [ ! -L "$KD_WORK" ] && [ "$(stat -c %d:%i "$KD_WORK" 2>/dev/null)" = "$KD_WORK_KEY" ]; then
+        rm -f "$KD_WORK/support.txt" "$KD_WORK/producer.status" || KDC_RC=1
+        rmdir "$KD_WORK" || KDC_RC=1
+      elif exists "$KD_WORK"; then KDC_RC=1; fi
+    fi
+    for KDC_FILE in "$KD_PARTIAL"; do
+      [ -n "$KDC_FILE" ] && exists "$KDC_FILE" || continue
+      if [ ! -L "$KDC_FILE" ] && [ -f "$KDC_FILE" ] && [ "$(stat -c %d:%i "$KDC_FILE" 2>/dev/null)" = "$KD_FILE_KEY" ]; then
+        rm -f "$KDC_FILE" || KDC_RC=1
+      else KDC_RC=1; fi
+    done
+    if [ "$KD_SUCCESS" != 1 ] && [ -n "$KD_ARCHIVE" ] && exists "$KD_ARCHIVE"; then
+      if [ ! -L "$KD_ARCHIVE" ] && [ -f "$KD_ARCHIVE" ] && [ "$(stat -c %d:%i "$KD_ARCHIVE" 2>/dev/null)" = "$KD_FILE_KEY" ]; then
+        rm -f "$KD_ARCHIVE" || KDC_RC=1
+      fi
+    fi
+    return "$KDC_RC"
+  }
+  trap 'KD_RC=$?; if ! kr_diagnostics_cleanup; then printf "%s\n" "FAIL: EarnApp diagnostics owned temporary cleanup could not be completed." >&2; KD_RC=1; fi; exit "$KD_RC"' EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  KD_WORK=$(mktemp -d "$KD_OUT/.earnapp-diagnostics-work-XXXXXXXX") || exit 1
+  KD_WORK_KEY=$(stat -c %d:%i "$KD_WORK") || exit 1
+  chmod 700 "$KD_WORK" || exit 1
+  # A producer status file preserves failure across the POSIX pipeline without
+  # ever writing raw collector text to disk. The only data file is sanitized.
+  (
+    KD_PRODUCER_RC=0
+    kr_diagnostics_support || KD_PRODUCER_RC=$?
+    printf '%s\n' "$KD_PRODUCER_RC" >"$KD_WORK/producer.status" || exit 1
+    exit "$KD_PRODUCER_RC"
+  ) | kr_diagnostics_filter >"$KD_WORK/support.txt" || exit 1
+  [ "$(cat "$KD_WORK/producer.status" 2>/dev/null)" = 0 ] &&
+    grep -Fxq 'APPLICATION=EarnApp' "$KD_WORK/support.txt" &&
+    [ "$(wc -c <"$KD_WORK/support.txt")" -le 16384 ] || exit 1
+  kr_diagnostics_directory "$KD_OUT" >/dev/null 2>&1 &&
+    [ "$(stat -c %d:%i "$KD_OUT")" = "$KD_PARENT_KEY" ] || exit 1
+  KD_PARTIAL=$(mktemp "$KD_OUT/.earnapp-diagnostics-partial-XXXXXXXX") || exit 1
+  KD_FILE_KEY=$(stat -c %d:%i "$KD_PARTIAL") || exit 1
+  KD_SUFFIX=${KD_PARTIAL##*/}; KD_SUFFIX=${KD_SUFFIX#.earnapp-diagnostics-partial-}
+  KD_ARCHIVE=$KD_OUT/earnapp-diagnostics-$KD_SUFFIX.tar.gz
+  tar -czf "$KD_PARTIAL" -C "$KD_WORK" support.txt 2>/dev/null || exit 1
+  chmod 600 "$KD_PARTIAL" &&
+    [ "$(stat -c %u:%h "$KD_PARTIAL")" = 0:1 ] &&
+    [ "$(stat -c %d:%i "$KD_PARTIAL")" = "$KD_FILE_KEY" ] || exit 1
+  # -T refuses a colliding directory; no -f means publication never clobbers an
+  # existing file, symlink or hardlink. Partial and final share the owned inode.
+  ln -T "$KD_PARTIAL" "$KD_ARCHIVE" 2>/dev/null || exit 1
+  [ ! -L "$KD_ARCHIVE" ] && [ "$(stat -c %d:%i "$KD_ARCHIVE")" = "$KD_FILE_KEY" ] || exit 1
+  KD_SUCCESS=1
+  kr_diagnostics_cleanup || { KD_SUCCESS=0; exit 1; }
+  KD_WORK=; KD_PARTIAL=
+  printf 'DIAGNOSTIC_BUNDLE=%s\n' "$KD_ARCHIVE"
+)
+
+kr_engine_diagnostics() {
+  [ "$#" = 0 ] || { printf '%s\n' 'FAIL: diagnostics accepts no arguments.' >&2; return 64; }
+  kr_diagnostics_bundle /var/tmp
 }
 
 unified_main "$CMD" "$APPLY"
